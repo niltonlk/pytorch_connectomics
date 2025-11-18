@@ -93,28 +93,28 @@ def readvol(filename: str, dataset: Optional[str]=None, drop_channel: bool=False
 ###############################
 
 def _parse_roi(roi: Optional[str]) -> Optional[List[slice]]:
-    """Parse ROI spec like "z0:z1,y0:y1,x0:x1" into slices.
+    """Parse ROI spec like "x0:x1,y0:y1,z0:z1" into slices for CloudVolume.
 
-    Accepts separators comma, semicolon, or pipe between axes. Returns None if
-    roi is None.
+    CloudVolume uses x,y,z ordering (Fortran-style). Accepts separators comma,
+    semicolon, or pipe between axes. Returns None if roi is None.
     """
     if roi is None:
         return None
-    # Allow URL anchors like ...#z0:z1,y0:y1,x0:x1
+    # Allow URL anchors like ...#x0:x1,y0:y1,z0:z1
     if '#' in roi:
         roi = roi.split('#', 1)[1]
     # Normalize separators to commas
     roi = roi.replace('|', ',').replace(';', ',')
     parts = [p.strip() for p in roi.split(',') if p.strip()]
     if len(parts) != 3:
-        raise ValueError("ROI must have three parts: 'z0:z1,y0:y1,x0:x1'")
+        raise ValueError("ROI must have three parts: 'x0:x1,y0:y1,z0:z1' (CloudVolume x,y,z order)")
 
     def _parse_part(p: str) -> slice:
         a, b = p.split(':')
         return slice(int(a), int(b))
 
-    z, y, x = map(_parse_part, parts)
-    return [z, y, x]
+    x, y, z = map(_parse_part, parts)
+    return [x, y, z]
 
 
 def _maybe_reorder_channels(arr: np.ndarray, drop_channel: bool=False) -> np.ndarray:
@@ -227,8 +227,11 @@ def readvol_precomputed(source: str, roi_spec: Optional[str]=None, drop_channel:
     """Read a Neuroglancer 'precomputed' volume using CloudVolume.
 
     To avoid accidental massive downloads, an ROI must be provided either:
-    - via the 'roi_spec' argument (e.g., '0:64,0:64,0:64'), or
+    - via the 'roi_spec' argument (e.g., '0:64,0:64,0:64' in x,y,z order), or
     - appended as a URL anchor to the source (e.g., 'precomputed://...#0:64,0:64,0:64').
+
+    Note: CloudVolume uses x,y,z (Fortran) ordering for both slicing and returned arrays.
+    This reader transposes to z,y,x (C-order) to match the rest of the pipeline.
     """
     if CloudVolume is None:
         raise ImportError("cloud-volume is required to read 'precomputed' sources. Install 'cloud-volume' and retry.")
@@ -242,22 +245,24 @@ def readvol_precomputed(source: str, roi_spec: Optional[str]=None, drop_channel:
 
     roi_slices = _parse_roi(roi_spec)
     if roi_slices is None:
-        raise ValueError("ROI is required for 'precomputed' volumes. Provide 'z0:z1,y0:y1,x0:x1' via dataset or URL #anchor.")
+        raise ValueError("ROI is required for 'precomputed' volumes. Provide 'x0:x1,y0:y1,z0:z1' via dataset or URL #anchor.")
 
-    # CloudVolume expects slicing as (z,y,x)
+    # CloudVolume expects slicing as (x,y,z) and returns (x,y,z[,c])
     cv = CloudVolume(url, progress=False, fill_missing=True, cache=False)
-    zsl, ysl, xsl = roi_slices
-    vol = cv[zsl, ysl, xsl]  # returns np.ndarray with shape (z,y,x[,c])
+    xsl, ysl, zsl = roi_slices
+    vol = cv[xsl, ysl, zsl]  # returns np.ndarray with shape (x,y,z[,c])
     data = np.asarray(vol)
 
-    # Move channels to front if present
+    # Transpose from CloudVolume (x,y,z[,c]) to pipeline standard (z,y,x[,c])
     if data.ndim == 4:
-        # CloudVolume returns (z,y,x,c)
-        data = data.transpose(3, 0, 1, 2)
+        # (x,y,z,c) -> (z,y,x,c) -> (c,z,y,x)
+        data = data.transpose(2, 1, 0, 3)  # (z,y,x,c)
+        data = data.transpose(3, 0, 1, 2)  # (c,z,y,x)
         if data.shape[0] == 1 and drop_channel:
             data = data[0]
     elif data.ndim == 3:
-        pass
+        # (x,y,z) -> (z,y,x)
+        data = data.transpose(2, 1, 0)
     else:
         raise RuntimeError(f"Unexpected dimensionality from CloudVolume: {data.shape}")
 

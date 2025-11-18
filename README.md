@@ -93,7 +93,7 @@ The data loader can now read volumes directly from:
 
 - Neuroglancer "precomputed" sources via CloudVolume (optional dependency):
   - Use a URL starting with `precomputed://`, `gs://`, `s3://`, or `file://`.
-  - To avoid massive downloads, an ROI is required and can be provided as a URL anchor: `precomputed://bucket/dataset#z0:z1,y0:y1,x0:x1` (voxel coordinates).
+  - To avoid massive downloads, an ROI is required and can be provided as a URL anchor: `precomputed://bucket/dataset#x0:x1,y0:y1,z0:z1` (CloudVolume uses x,y,z ordering).
 
 Notes:
 - These readers are optional: install `zarr` for OME-Zarr and `cloud-volume` for precomputed.
