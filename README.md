@@ -82,3 +82,19 @@ For a detailed description of our framework, please read this [technical report]
   year={2021}
 }
 ```
+
+### New: Native OME-Zarr and Neuroglancer "precomputed" readers (experimental)
+
+The data loader can now read volumes directly from:
+
+- OME-Zarr stores: pass a path ending with `.ome.zarr` or `.zarr`.
+  - Optionally select a specific internal array with a `#group/key` suffix, e.g. `/data/sample.ome.zarr#0`.
+  - By default, the first multiscale dataset (usually `0`) is used.
+
+- Neuroglancer "precomputed" sources via CloudVolume (optional dependency):
+  - Use a URL starting with `precomputed://`, `gs://`, `s3://`, or `file://`.
+  - To avoid massive downloads, an ROI is required and can be provided as a URL anchor: `precomputed://bucket/dataset#z0:z1,y0:y1,x0:x1` (voxel coordinates).
+
+Notes:
+- These readers are optional: install `zarr` for OME-Zarr and `cloud-volume` for precomputed.
+- Shapes are normalized to (z,y,x) or (c,z,y,x); single-channel volumes can be auto-squeezed when configured.

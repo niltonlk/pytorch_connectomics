@@ -14,6 +14,17 @@ import imageio
 import pickle
 from scipy.ndimage import zoom
 
+# Optional imports for additional volume formats
+try:  # OME-Zarr
+    import zarr  # type: ignore
+except Exception:  # pragma: no cover - optional dep
+    zarr = None  # type: ignore
+
+try:  # Neuroglancer precomputed via CloudVolume
+    from cloudvolume import CloudVolume  # type: ignore
+except Exception:  # pragma: no cover - optional dep
+    CloudVolume = None  # type: ignore
+
 
 def readimg_as_vol(filename, drop_channel=False):
     img_suf = filename[filename.rfind('.')+1:]
@@ -43,6 +54,14 @@ def readh5(filename, dataset=None):
 def readvol(filename: str, dataset: Optional[str]=None, drop_channel: bool=False):
     r"""Load volumetric data in HDF5, TIFF or PNG formats.
     """
+    # Dispatch by prefix/suffix for extended formats
+    if filename.startswith('precomputed://') or filename.startswith('gs://') \
+       or filename.startswith('s3://') or filename.startswith('file://'):
+        return readvol_precomputed(filename, roi_spec=dataset, drop_channel=drop_channel)
+
+    if filename.endswith('.zarr') or filename.endswith('.ome.zarr'):
+        return readvol_ome_zarr(filename, dataset=dataset, drop_channel=drop_channel)
+
     img_suf = filename[filename.rfind('.')+1:]
     if img_suf in ['h5', 'hdf5']:
         data = readh5(filename, dataset)
@@ -66,6 +85,183 @@ def readvol(filename: str, dataset: Optional[str]=None, drop_channel: bool=False
         orig_dtype = data.dtype
         data = np.mean(data, axis=0).astype(orig_dtype)
  
+    return data
+
+
+###############################
+# Extended readers
+###############################
+
+def _parse_roi(roi: Optional[str]) -> Optional[List[slice]]:
+    """Parse ROI spec like "z0:z1,y0:y1,x0:x1" into slices.
+
+    Accepts separators comma, semicolon, or pipe between axes. Returns None if
+    roi is None.
+    """
+    if roi is None:
+        return None
+    # Allow URL anchors like ...#z0:z1,y0:y1,x0:x1
+    if '#' in roi:
+        roi = roi.split('#', 1)[1]
+    # Normalize separators to commas
+    roi = roi.replace('|', ',').replace(';', ',')
+    parts = [p.strip() for p in roi.split(',') if p.strip()]
+    if len(parts) != 3:
+        raise ValueError("ROI must have three parts: 'z0:z1,y0:y1,x0:x1'")
+
+    def _parse_part(p: str) -> slice:
+        a, b = p.split(':')
+        return slice(int(a), int(b))
+
+    z, y, x = map(_parse_part, parts)
+    return [z, y, x]
+
+
+def _maybe_reorder_channels(arr: np.ndarray, drop_channel: bool=False) -> np.ndarray:
+    """Reorder/strip channels to match expected (z,y,x) or (c,z,y,x).
+
+    Heuristics:
+    - If 5D, assume (t,c,z,y,x) or (t,z,y,x,c); pick t=0, then reduce to 4D.
+    - If 4D and one axis looks like channels (<=10), move to channel-first.
+    - If the final axis is singleton channel, squeeze when drop_channel or keep as grayscale.
+    """
+    data = arr
+    # Handle 5D (t, c, z, y, x) or (t, z, y, x, c)
+    if data.ndim == 5:
+        # choose the first timepoint
+        if data.shape[1] <= 10:  # (t,c,z,y,x)
+            data = data[0]
+        elif data.shape[-1] <= 10:  # (t,z,y,x,c)
+            data = data[0]
+        else:
+            # Assume time first, drop it
+            data = data[0]
+
+    if data.ndim == 4:
+        # Could be (c,z,y,x) or (z,y,x,c)
+        # If first dim small, assume channel-first already
+        if data.shape[0] <= 10 and data.shape[1] > 16:
+            pass  # (c,z,y,x)
+        elif data.shape[-1] <= 10:
+            data = data.transpose(3, 0, 1, 2)  # (z,y,x,c) -> (c,z,y,x)
+        else:
+            # Unknown, assume already (c,z,y,x)
+            pass
+
+    elif data.ndim == 3:
+        # (z,y,x) OK
+        pass
+
+    # If channel dimension exists but is 1 and drop_channel requested, collapse
+    if data.ndim == 4 and data.shape[0] == 1 and drop_channel:
+        data = data[0]
+
+    return data
+
+
+def readvol_ome_zarr(path: str, dataset: Optional[str]=None, drop_channel: bool=False) -> np.ndarray:
+    """Read an OME-Zarr or .zarr volume.
+
+    Selection priority:
+    1) If 'dataset' is provided, use it as a group/array key inside the store.
+    2) If group has OME-NGFF 'multiscales', open datasets[0]['path'] (usually '0').
+    3) Otherwise, pick the first array found in a BFS walk.
+    """
+    if zarr is None:
+        raise ImportError("zarr is required to read OME-Zarr volumes. Install 'zarr' and retry.")
+
+    store = zarr.open(path, mode='r')
+
+    def _first_array(node):
+        # BFS over group tree to find first zarr array
+        queue = [node]
+        while queue:
+            cur = queue.pop(0)
+            try:
+                import zarr as _z  # local alias
+                if isinstance(cur, _z.Array):
+                    return cur
+            except Exception:
+                pass
+            if hasattr(cur, 'values'):
+                for v in cur.values():
+                    queue.append(v)
+        return None
+
+    arr = None
+    grp = store
+    # Check for multiscales attr at group root
+    try:
+        attrs = getattr(grp, 'attrs', {})
+        ms = attrs.get('multiscales') if hasattr(attrs, 'get') else None
+    except Exception:
+        ms = None
+
+    if dataset is not None:
+        # Support URLs like path#group/key
+        key = dataset.split('#', 1)[-1]
+        try:
+            arr = grp[key]
+        except Exception as e:
+            raise KeyError(f"Dataset key '{key}' not found in zarr store: {e}")
+    elif ms:
+        try:
+            key = ms[0]['datasets'][0]['path']
+            arr = grp[key]
+        except Exception:
+            arr = _first_array(grp)
+    else:
+        arr = _first_array(grp)
+
+    if arr is None:
+        raise RuntimeError("No array found in the provided OME-Zarr store.")
+
+    data = np.asarray(arr)
+    data = _maybe_reorder_channels(data, drop_channel=drop_channel)
+    # Final validation
+    assert data.ndim in [3, 4], f"OME-Zarr reader expects 3D or 4D arrays, got {data.ndim}D"
+    return data
+
+
+def readvol_precomputed(source: str, roi_spec: Optional[str]=None, drop_channel: bool=False) -> np.ndarray:
+    """Read a Neuroglancer 'precomputed' volume using CloudVolume.
+
+    To avoid accidental massive downloads, an ROI must be provided either:
+    - via the 'roi_spec' argument (e.g., '0:64,0:64,0:64'), or
+    - appended as a URL anchor to the source (e.g., 'precomputed://...#0:64,0:64,0:64').
+    """
+    if CloudVolume is None:
+        raise ImportError("cloud-volume is required to read 'precomputed' sources. Install 'cloud-volume' and retry.")
+
+    # Allow ROI in URL anchor if present
+    url, anchor = source, None
+    if '#' in source:
+        url, anchor = source.split('#', 1)
+        if roi_spec is None:
+            roi_spec = anchor
+
+    roi_slices = _parse_roi(roi_spec)
+    if roi_slices is None:
+        raise ValueError("ROI is required for 'precomputed' volumes. Provide 'z0:z1,y0:y1,x0:x1' via dataset or URL #anchor.")
+
+    # CloudVolume expects slicing as (z,y,x)
+    cv = CloudVolume(url, progress=False, fill_missing=True, cache=False)
+    zsl, ysl, xsl = roi_slices
+    vol = cv[zsl, ysl, xsl]  # returns np.ndarray with shape (z,y,x[,c])
+    data = np.asarray(vol)
+
+    # Move channels to front if present
+    if data.ndim == 4:
+        # CloudVolume returns (z,y,x,c)
+        data = data.transpose(3, 0, 1, 2)
+        if data.shape[0] == 1 and drop_channel:
+            data = data[0]
+    elif data.ndim == 3:
+        pass
+    else:
+        raise RuntimeError(f"Unexpected dimensionality from CloudVolume: {data.shape}")
+
+    assert data.ndim in [3, 4]
     return data
 
 
