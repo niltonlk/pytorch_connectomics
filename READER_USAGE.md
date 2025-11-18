@@ -59,29 +59,33 @@ DATASET:
   ```
 
 **ROI requirement (important):**
-- To avoid accidental massive downloads, you **must** provide an ROI in voxel coordinates:
-  - Either via the `dataset` argument: `readvol(url, dataset='z0:z1,y0:y1,x0:x1')`
-  - Or appended as a URL anchor: `readvol('precomputed://bucket/seg#0:64,0:128,0:128')`
+- To avoid accidental massive downloads, you **must** provide an ROI in voxel coordinates.
+- CloudVolume uses **x,y,z ordering** (Fortran-style), so specify: `x0:x1,y0:y1,z0:z1`
+  - Either via the `dataset` argument: `readvol(url, dataset='x0:x1,y0:y1,z0:z1')`
+  - Or appended as a URL anchor: `readvol('precomputed://bucket/seg#0:128,0:128,0:64')`
 
 **Usage:**
 
-A. **Public GCS source with ROI anchor**
+A. **Public GCS source with ROI anchor (x,y,z order)**
 ```python
 from connectomics.data.utils.data_io import readvol
 
-url = 'precomputed://gs://neuroglancer-janelia-flyem-hemibrain/v1.0/segmentation#1000:1064,2000:2128,3000:3128'
+# ROI: x=[1000,1064), y=[2000,2128), z=[3000,3064)
+url = 'precomputed://gs://neuroglancer-janelia-flyem-hemibrain/v1.0/segmentation#1000:1064,2000:2128,3000:3064'
 vol = readvol(url)
-# Returns shape (c,64,128,128) or (64,128,128) depending on channels
+# Returns shape (c,64,128,64) or (64,128,64) after transpose to z,y,x
 ```
 
 B. **Local precomputed store**
 ```python
+# x,y,z spans: [0,100) each
 vol = readvol('file:///data/precomputed/myseg#0:100,0:100,0:100')
 ```
 
 **Configuration in YACS:**
 ```yaml
 DATASET:
+  # ROI in x,y,z order: x=[500,564), y=[1000,1128), z=[2000,2128)
   IMAGE_NAME: 'precomputed://gs://bucket/dataset#500:564,1000:1128,2000:2128'
 ```
 
