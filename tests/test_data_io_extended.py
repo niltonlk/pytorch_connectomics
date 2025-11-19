@@ -152,7 +152,7 @@ def test_write_omezarr_with_offset():
 def test_offset_metadata_from_precomputed():
     """Test that offset metadata is captured from precomputed reader and used in writer."""
     zarr = pytest.importorskip("zarr")
-    cv = pytest.importorskip("cloud_volume", reason="CloudVolume not installed")
+    pytest.importorskip("cloudvolume", reason="CloudVolume not installed")
     
     # This test requires CloudVolume and a mock/real precomputed source
     # For now, we'll test the metadata storage mechanism directly
