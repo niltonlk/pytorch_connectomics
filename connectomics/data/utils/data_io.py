@@ -464,11 +464,28 @@ def write_ome_zarr(filename: str, vol: np.ndarray, dataset: Optional[str] = None
     try:
         if vol.ndim == 3:
             arr.attrs["_ARRAY_DIMENSIONS"] = ["z", "y", "x"]
+            # Neuroglancer-compatible axis labels
+            arr.attrs["dimension_names"] = ["z", "y", "x"]
         elif vol.ndim == 4:
             arr.attrs["_ARRAY_DIMENSIONS"] = ["c", "z", "y", "x"]
+            # Neuroglancer-compatible axis labels
+            arr.attrs["dimension_names"] = ["c^", "z", "y", "x"]
     except Exception:
         # Attribute setting is best-effort; ignore if store forbids attrs
         pass
+    
+    # Add Neuroglancer resolution metadata if available
+    # Neuroglancer expects resolution in nanometers in [x,y,z] order at array level
+    if resolution is not None:
+        try:
+            # resolution is in (z,y,x) nm, convert to [x,y,z] for Neuroglancer
+            ng_resolution = [resolution[2], resolution[1], resolution[0]]
+            if vol.ndim == 4:
+                # For 4D, prepend channel resolution (usually 1)
+                ng_resolution = [1.0] + ng_resolution
+            arr.attrs["resolution"] = ng_resolution
+        except Exception:
+            pass
     
     # Add OME-NGFF multiscales metadata if requested
     if multiscale:
