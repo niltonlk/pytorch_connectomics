@@ -27,9 +27,17 @@ vol = readvol('/path/to/data.ome.zarr')
 # Picks first dataset in multiscales (usually '0')
 ```
 
-B. **Select a specific array key**
+B. **Select a specific pyramid level (MIP level)**
 ```python
+# Full resolution (default)
 vol = readvol('/path/to/data.ome.zarr', dataset='0')
+
+# MIP level 1 (2x downsampled)
+vol = readvol('/path/to/data.ome.zarr', dataset='1')
+
+# MIP level 2 (4x downsampled)
+vol = readvol('/path/to/data.ome.zarr', dataset='2')
+
 # or pass key in URL anchor:
 vol = readvol('/path/to/data.ome.zarr#2')
 ```
@@ -70,13 +78,24 @@ A. **Public GCS source with ROI anchor (x,y,z order)**
 ```python
 from connectomics.data.utils.data_io import readvol
 
-# ROI: x=[1000,1064), y=[2000,2128), z=[3000,3064)
+# Full resolution (MIP 0), ROI: x=[1000,1064), y=[2000,2128), z=[3000,3064)
 url = 'precomputed://gs://neuroglancer-janelia-flyem-hemibrain/v1.0/segmentation#1000:1064,2000:2128,3000:3064'
 vol = readvol(url)
 # Returns shape (c,64,128,64) or (64,128,64) after transpose to z,y,x
 ```
 
-B. **Local precomputed store**
+B. **Select a MIP level (downsampled pyramid)**
+```python
+# MIP level 1 (2x downsampled): x=[500,532), y=[1000,1064), z=[1500,1532)
+url = 'precomputed://gs://bucket/data@1#500:532,1000:1064,1500:1532'
+vol = readvol(url)
+
+# MIP level 2 (4x downsampled)
+url = 'precomputed://gs://bucket/data@2#250:266,500:532,750:766'
+vol = readvol(url)
+```
+
+C. **Local precomputed store**
 ```python
 # x,y,z spans: [0,100) each
 vol = readvol('file:///data/precomputed/myseg#0:100,0:100,0:100')
@@ -85,8 +104,11 @@ vol = readvol('file:///data/precomputed/myseg#0:100,0:100,0:100')
 **Configuration in YACS:**
 ```yaml
 DATASET:
-  # ROI in x,y,z order: x=[500,564), y=[1000,1128), z=[2000,2128)
+  # Full resolution, ROI in x,y,z order: x=[500,564), y=[1000,1128), z=[2000,2128)
   IMAGE_NAME: 'precomputed://gs://bucket/dataset#500:564,1000:1128,2000:2128'
+  
+  # Or use MIP level 1 (2x downsampled)
+  IMAGE_NAME: 'precomputed://gs://bucket/dataset@1#250:282,500:564,1000:1064'
 ```
 
 ---
@@ -124,10 +146,24 @@ DATASET:
 
 ---
 
-## 6. Known Limitations & Future Work
+## 6. MIP Level Selection Summary
+
+| Format | Method 1 (parameter) | Method 2 (URL) | Example |
+|--------|---------------------|----------------|---------|
+| **OME-Zarr** | `dataset='N'` | `path#N` | `data.ome.zarr#2` for MIP 2 |
+| **Precomputed** | N/A (use URL) | `url@N#roi` | `precomputed://gs://...@1#0:64,0:64,0:64` |
+
+**Notes:**
+- OME-Zarr pyramid levels are typically named '0' (full res), '1' (2x down), '2' (4x down), etc.
+- Neuroglancer precomputed uses `mip=0` (full res), `mip=1` (2x), `mip=2` (4x), etc.
+- ROI coordinates for precomputed should match the resolution of the selected MIP level
+
+---
+
+## 7. Known Limitations & Future Work
 
 - **CloudVolume caching:** Currently disabled (`cache=False`) to avoid stale data. Future versions may integrate with a persistent cache.
-- **Multiscale pyramids:** OME-Zarr reader picks the first dataset by default; explicit selection is supported via the `dataset` parameter.
+- **Multiscale pyramids:** Both readers support explicit MIP level selection; see section 6 above.
 - **Large ROIs:** For very large bounding boxes, consider loading via the existing tile/chunked dataset or converting to HDF5.
 - **Axis ambiguity:** For unusual array shapes (e.g., all dimensions < 10), manual axis reordering may be needed.
 

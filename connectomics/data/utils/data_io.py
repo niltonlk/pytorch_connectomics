@@ -164,6 +164,8 @@ def readvol_ome_zarr(path: str, dataset: Optional[str]=None, drop_channel: bool=
 
     Selection priority:
     1) If 'dataset' is provided, use it as a group/array key inside the store.
+       - For multiscales/pyramids, use '0' (full res), '1', '2', etc.
+       - Example: readvol('data.ome.zarr', dataset='2')  # MIP level 2
     2) If group has OME-NGFF 'multiscales', open datasets[0]['path'] (usually '0').
     3) Otherwise, pick the first array found in a BFS walk.
     """
@@ -223,12 +225,17 @@ def readvol_ome_zarr(path: str, dataset: Optional[str]=None, drop_channel: bool=
     return data
 
 
-def readvol_precomputed(source: str, roi_spec: Optional[str]=None, drop_channel: bool=False) -> np.ndarray:
+def readvol_precomputed(source: str, roi_spec: Optional[str]=None, drop_channel: bool=False, mip: int=0) -> np.ndarray:
     """Read a Neuroglancer 'precomputed' volume using CloudVolume.
 
     To avoid accidental massive downloads, an ROI must be provided either:
     - via the 'roi_spec' argument (e.g., '0:64,0:64,0:64' in x,y,z order), or
     - appended as a URL anchor to the source (e.g., 'precomputed://...#0:64,0:64,0:64').
+    
+    MIP level selection:
+    - Use 'mip=0' (default) for full resolution
+    - Use 'mip=1', 'mip=2', etc. for downsampled pyramid levels
+    - Or append @mip to URL: 'precomputed://...@2#0:64,0:64,0:64'
 
     Note: CloudVolume uses x,y,z (Fortran) ordering for both slicing and returned arrays.
     This reader transposes to z,y,x (C-order) to match the rest of the pipeline.
@@ -236,9 +243,21 @@ def readvol_precomputed(source: str, roi_spec: Optional[str]=None, drop_channel:
     if CloudVolume is None:
         raise ImportError("cloud-volume is required to read 'precomputed' sources. Install 'cloud-volume' and retry.")
 
-    # Allow ROI in URL anchor if present
+    # Parse MIP level from URL if present (e.g., precomputed://...@2#roi)
     url, anchor = source, None
-    if '#' in source:
+    if '@' in source:
+        # Extract MIP from @N notation
+        parts = source.split('@')
+        url = parts[0]
+        rest = parts[1]
+        if '#' in rest:
+            mip_str, anchor = rest.split('#', 1)
+            mip = int(mip_str)
+            if roi_spec is None:
+                roi_spec = anchor
+        else:
+            mip = int(rest)
+    elif '#' in source:
         url, anchor = source.split('#', 1)
         if roi_spec is None:
             roi_spec = anchor
@@ -248,7 +267,7 @@ def readvol_precomputed(source: str, roi_spec: Optional[str]=None, drop_channel:
         raise ValueError("ROI is required for 'precomputed' volumes. Provide 'x0:x1,y0:y1,z0:z1' via dataset or URL #anchor.")
 
     # CloudVolume expects slicing as (x,y,z) and returns (x,y,z[,c])
-    cv = CloudVolume(url, progress=False, fill_missing=True, cache=False)
+    cv = CloudVolume(url, mip=mip, progress=False, fill_missing=True, cache=False)
     xsl, ysl, zsl = roi_slices
     vol = cv[xsl, ysl, zsl]  # returns np.ndarray with shape (x,y,z[,c])
     data = np.asarray(vol)
