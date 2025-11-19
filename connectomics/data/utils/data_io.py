@@ -342,7 +342,8 @@ def readvol_precomputed(source: str, roi_spec: Optional[str]=None, drop_channel:
 def write_ome_zarr(filename: str, vol: np.ndarray, dataset: Optional[str] = None,
                    chunks: Optional[tuple] = None, compression: str = 'blosc',
                    multiscale: bool = False, offset: Optional[List[float]] = None, 
-                   resolution: Optional[List[float]] = None, source: Optional[str] = None) -> None:
+                   resolution: Optional[List[float]] = None, source: Optional[str] = None,
+                   zarr_format: int = 2) -> None:
     """Write a volume as OME-Zarr format with optional spatial transforms.
     
     Args:
@@ -355,6 +356,7 @@ def write_ome_zarr(filename: str, vol: np.ndarray, dataset: Optional[str] = None
         offset: Spatial offset (z,y,x) in voxels. If None and source is provided, retrieved from _VOLUME_METADATA.
         resolution: Voxel resolution (z,y,x) in nm. If None and source is provided, retrieved from _VOLUME_METADATA.
         source: Source file/URL key to lookup metadata in _VOLUME_METADATA. Used if offset/resolution not provided.
+        zarr_format: Zarr format version (2 or 3). Default: 2 for better compatibility.
     """
     if zarr is None:
         raise ImportError("zarr is required to write OME-Zarr volumes. Install 'zarr' and retry.")
@@ -379,8 +381,14 @@ def write_ome_zarr(filename: str, vol: np.ndarray, dataset: Optional[str] = None
     if not (filename.endswith('.zarr') or filename.endswith('.ome.zarr')):
         filename = filename + '.ome.zarr'
     
-    # Open or create zarr store
-    store = zarr.open(filename, mode='a')  # 'a' = read/write, create if doesn't exist
+    # Open or create zarr store with specified format
+    # zarr_format=2 uses the older, more compatible format
+    # zarr_format=3 uses the newer async format
+    try:
+        store = zarr.open(filename, mode='a', zarr_format=zarr_format)
+    except TypeError:
+        # Older zarr versions don't have zarr_format parameter
+        store = zarr.open(filename, mode='a')
     
     # Determine dataset key
     if dataset is None:
