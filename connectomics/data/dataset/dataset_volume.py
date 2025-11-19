@@ -380,7 +380,16 @@ class VolumeDataset(torch.utils.data.Dataset):
     # Utils
     #######################################################
     def _process_image(self, x: np.array):
-        x = np.expand_dims(x, 0) # (z,y,x) -> (c,z,y,x)
+        # Ensure channel-first 4D: accept (z,y,x) or (c,z,y,x)
+        if x.ndim == 3:
+            x = np.expand_dims(x, 0)  # (z,y,x) -> (1,z,y,x)
+        elif x.ndim == 4:
+            # Assume already (c,z,y,x); leave unchanged
+            pass
+        else:
+            raise AssertionError(
+                f"Unexpected image ndim {x.ndim}; expected 3D (z,y,x) or 4D (c,z,y,x)."
+            )
         x = normalize_image(x, self.data_mean, self.data_std,
                             match_act=self.data_match_act)
         return x
