@@ -86,3 +86,105 @@ def test_write_omezarr_basic(shape, multiscale):
         if multiscale:
             assert 'multiscales' in store.attrs
             assert len(store.attrs['multiscales']) > 0
+
+
+def test_write_omezarr_with_offset():
+    """Test that offset and resolution metadata are correctly stored in OME-Zarr."""
+    zarr = pytest.importorskip("zarr")
+    dio = _load_data_io()
+
+    # Create test data
+    vol = np.random.randint(0, 255, (32, 64, 64), dtype=np.uint8)
+    
+    # Define offset and resolution
+    offset = [100, 200, 300]  # (z,y,x) in voxels
+    resolution = [40.0, 4.0, 4.0]  # (z,y,x) in nm
+
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "output_with_offset.ome.zarr")
+        
+        # Write with offset and resolution
+        dio.write_ome_zarr(path, vol, dataset='0', multiscale=True, 
+                          offset=offset, resolution=resolution)
+        
+        # Verify the file was created
+        assert os.path.exists(path)
+        
+        # Read back and verify data
+        store = zarr.open(path, mode='r')
+        assert '0' in store
+        read_vol = np.array(store['0'])
+        np.testing.assert_array_equal(read_vol, vol)
+        
+        # Check multiscales metadata contains offset and resolution
+        assert 'multiscales' in store.attrs
+        multiscales = store.attrs['multiscales']
+        assert len(multiscales) > 0
+        
+        datasets = multiscales[0]['datasets']
+        assert len(datasets) > 0
+        
+        transforms = datasets[0]['coordinateTransformations']
+        assert len(transforms) >= 2
+        
+        # Check for translation transform (offset)
+        translation_found = False
+        for t in transforms:
+            if t['type'] == 'translation':
+                translation_found = True
+                assert 'translation' in t
+                # Offset should match (converted to float)
+                assert t['translation'] == [float(offset[0]), float(offset[1]), float(offset[2])]
+        assert translation_found, "Translation transform not found in metadata"
+        
+        # Check for scale transform (resolution converted to micrometers)
+        scale_found = False
+        for t in transforms:
+            if t['type'] == 'scale':
+                scale_found = True
+                assert 'scale' in t
+                # Resolution should be converted from nm to μm
+                expected_scale = [resolution[0] / 1000.0, resolution[1] / 1000.0, resolution[2] / 1000.0]
+                np.testing.assert_allclose(t['scale'], expected_scale, rtol=1e-6)
+        assert scale_found, "Scale transform not found in metadata"
+
+
+def test_offset_metadata_from_precomputed():
+    """Test that offset metadata is captured from precomputed reader and used in writer."""
+    zarr = pytest.importorskip("zarr")
+    cv = pytest.importorskip("cloud_volume", reason="CloudVolume not installed")
+    
+    # This test requires CloudVolume and a mock/real precomputed source
+    # For now, we'll test the metadata storage mechanism directly
+    dio = _load_data_io()
+    
+    # Simulate storing metadata as readvol_precomputed would
+    test_url = "precomputed://test-bucket/dataset@1#0-100_0-200_0-300"
+    test_metadata = {
+        'offset': [0, 0, 0],  # (z,y,x) in voxels
+        'resolution': [40.0, 4.0, 4.0],  # (z,y,x) in nm
+        'mip': 1,
+        'url': "precomputed://test-bucket/dataset"
+    }
+    dio._VOLUME_METADATA[test_url] = test_metadata
+    
+    # Create test volume
+    vol = np.random.randint(0, 255, (32, 64, 64), dtype=np.uint8)
+    
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "from_metadata.ome.zarr")
+        
+        # Write using metadata from source
+        dio.write_ome_zarr(path, vol, dataset='0', multiscale=True, source=test_url)
+        
+        # Verify metadata was used
+        store = zarr.open(path, mode='r')
+        multiscales = store.attrs['multiscales']
+        transforms = multiscales[0]['datasets'][0]['coordinateTransformations']
+        
+        # Check translation exists
+        has_translation = any(t['type'] == 'translation' for t in transforms)
+        assert has_translation, "Offset metadata should have been applied"
+    
+    # Clean up global state
+    dio._VOLUME_METADATA.clear()

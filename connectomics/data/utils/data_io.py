@@ -25,6 +25,10 @@ try:  # Neuroglancer precomputed via CloudVolume
 except Exception:  # pragma: no cover - optional dep
     CloudVolume = None  # type: ignore
 
+# Global metadata storage for volume spatial information (ROI offsets, resolution, etc.)
+# Key: volume id or filename, Value: dict with 'offset', 'resolution', 'mip', etc.
+_VOLUME_METADATA = {}
+
 
 def readimg_as_vol(filename, drop_channel=False):
     img_suf = filename[filename.rfind('.')+1:]
@@ -272,6 +276,19 @@ def readvol_precomputed(source: str, roi_spec: Optional[str]=None, drop_channel:
     vol = cv[xsl, ysl, zsl]  # returns np.ndarray with shape (x,y,z[,c])
     data = np.asarray(vol)
 
+    # Store ROI metadata for later use (e.g., when saving with offset)
+    # Offset in (z,y,x) order matching pipeline convention
+    offset_zyx = [zsl.start, ysl.start, xsl.start]
+    resolution = cv.resolution  # (x,y,z) in nanometers
+    resolution_zyx = [resolution[2], resolution[1], resolution[0]]  # convert to (z,y,x)
+    
+    _VOLUME_METADATA[source] = {
+        'offset': offset_zyx,  # (z,y,x) in voxels
+        'resolution': resolution_zyx,  # (z,y,x) in nm
+        'mip': mip,
+        'url': url,
+    }
+
     # Transpose from CloudVolume (x,y,z[,c]) to pipeline standard (z,y,x[,c])
     if data.ndim == 4:
         # (x,y,z,c) -> (z,y,x,c) -> (c,z,y,x)
@@ -291,8 +308,9 @@ def readvol_precomputed(source: str, roi_spec: Optional[str]=None, drop_channel:
 
 def write_ome_zarr(filename: str, vol: np.ndarray, dataset: Optional[str] = None,
                    chunks: Optional[tuple] = None, compression: str = 'blosc',
-                   multiscale: bool = False) -> None:
-    """Write a volume as OME-Zarr format.
+                   multiscale: bool = False, offset: Optional[List[float]] = None, 
+                   resolution: Optional[List[float]] = None, source: Optional[str] = None) -> None:
+    """Write a volume as OME-Zarr format with optional spatial transforms.
     
     Args:
         filename: Path to output .zarr or .ome.zarr file
@@ -301,9 +319,28 @@ def write_ome_zarr(filename: str, vol: np.ndarray, dataset: Optional[str] = None
         chunks: Chunk size for zarr array. If None, uses zarr's auto-chunking.
         compression: Compression algorithm. Default 'blosc'.
         multiscale: If True, creates OME-NGFF multiscales metadata for level 0.
+        offset: Spatial offset (z,y,x) in voxels. If None and source is provided, retrieved from _VOLUME_METADATA.
+        resolution: Voxel resolution (z,y,x) in nm. If None and source is provided, retrieved from _VOLUME_METADATA.
+        source: Source file/URL key to lookup metadata in _VOLUME_METADATA. Used if offset/resolution not provided.
     """
     if zarr is None:
         raise ImportError("zarr is required to write OME-Zarr volumes. Install 'zarr' and retry.")
+    
+    # Retrieve metadata from _VOLUME_METADATA if available and not explicitly provided
+    if offset is None or resolution is None:
+        # Try to find metadata from source or from any available entry (fallback to last read)
+        meta = None
+        if source and source in _VOLUME_METADATA:
+            meta = _VOLUME_METADATA[source]
+        elif len(_VOLUME_METADATA) > 0:
+            # Fallback: use the last metadata entry (useful for single-volume inference)
+            meta = list(_VOLUME_METADATA.values())[-1]
+        
+        if meta:
+            if offset is None and 'offset' in meta:
+                offset = meta['offset']
+            if resolution is None and 'resolution' in meta:
+                resolution = meta['resolution']
     
     # Ensure filename ends with .zarr or .ome.zarr
     if not (filename.endswith('.zarr') or filename.endswith('.ome.zarr')):
@@ -350,6 +387,40 @@ def write_ome_zarr(filename: str, vol: np.ndarray, dataset: Optional[str] = None
     
     # Add OME-NGFF multiscales metadata if requested
     if multiscale:
+        # Build coordinateTransformations list
+        transforms = []
+        
+        # Add translation if offset is provided (in voxels)
+        if offset is not None:
+            if vol.ndim == 3:
+                transforms.append({
+                    "type": "translation",
+                    "translation": [float(offset[0]), float(offset[1]), float(offset[2])]  # (z,y,x)
+                })
+            elif vol.ndim == 4:
+                # For 4D (c,z,y,x), translation applies to spatial dims only
+                transforms.append({
+                    "type": "translation",
+                    "translation": [0.0, float(offset[0]), float(offset[1]), float(offset[2])]  # (c,z,y,x)
+                })
+        
+        # Add scale (resolution in micrometers, or default 1.0)
+        if resolution is not None:
+            # Convert nm to μm
+            if vol.ndim == 3:
+                scale = [resolution[0] / 1000.0, resolution[1] / 1000.0, resolution[2] / 1000.0]  # (z,y,x)
+            elif vol.ndim == 4:
+                scale = [1.0, resolution[0] / 1000.0, resolution[1] / 1000.0, resolution[2] / 1000.0]  # (c,z,y,x)
+            transforms.append({
+                "type": "scale",
+                "scale": scale
+            })
+        else:
+            transforms.append({
+                "type": "scale",
+                "scale": [1.0] * vol.ndim
+            })
+        
         multiscales_meta = [{
             "version": "0.4",
             "name": dataset,
@@ -365,10 +436,7 @@ def write_ome_zarr(filename: str, vol: np.ndarray, dataset: Optional[str] = None
             ],
             "datasets": [{
                 "path": dataset,
-                "coordinateTransformations": [{
-                    "type": "scale",
-                    "scale": [1.0] * vol.ndim
-                }]
+                "coordinateTransformations": transforms
             }]
         }]
         store.attrs['multiscales'] = multiscales_meta
