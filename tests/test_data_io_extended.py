@@ -188,3 +188,23 @@ def test_offset_metadata_from_precomputed():
     
     # Clean up global state
     dio._VOLUME_METADATA.clear()
+
+
+def test_parse_roi_formats_backward_compat():
+    """ROI parser accepts both legacy and new formats, yielding x,y,z slices."""
+    dio = _load_data_io()
+
+    # Legacy format (x,y,z) with colons/commas
+    legacy = "0:128,131072:132096,131072:132096"
+    xsl, ysl, zsl = dio._parse_roi(legacy)
+    assert (xsl.start, xsl.stop) == (0, 128)
+    assert (ysl.start, ysl.stop) == (131072, 132096)
+    assert (zsl.start, zsl.stop) == (131072, 132096)
+
+    # New format (z,y,x) with hyphens/underscores
+    new = "0-128_131072-132096_131072-132096"
+    xsl2, ysl2, zsl2 = dio._parse_roi(new)
+    # Expect identical slices as above after reordering to x,y, z
+    assert (xsl2.start, xsl2.stop) == (131072, 132096)
+    assert (ysl2.start, ysl2.stop) == (131072, 132096)
+    assert (zsl2.start, zsl2.stop) == (0, 128)

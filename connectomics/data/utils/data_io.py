@@ -97,28 +97,61 @@ def readvol(filename: str, dataset: Optional[str]=None, drop_channel: bool=False
 ###############################
 
 def _parse_roi(roi: Optional[str]) -> Optional[List[slice]]:
-    """Parse ROI spec like "x0:x1,y0:y1,z0:z1" into slices for CloudVolume.
+    """Parse ROI specification into CloudVolume-style slices (x,y,z order).
 
-    CloudVolume uses x,y,z ordering (Fortran-style). Accepts separators comma,
-    semicolon, or pipe between axes. Returns None if roi is None.
+    Supported formats:
+    - Legacy (x,y,z with colons/commas): "x0:x1,y0:y1,z0:z1" or "0:10,20:30,40:50"
+    - New (z,y,x with hyphens/underscores): "z0-z1_y0-y1_x0-x1" or "0-10_20-30_40-50"
+
+    Returns:
+        List[slice]: [x_slice, y_slice, z_slice] suitable for CloudVolume indexing.
     """
     if roi is None:
         return None
-    # Allow URL anchors like ...#x0:x1,y0:y1,z0:z1
+
+    # Strip URL anchor if present
     if '#' in roi:
         roi = roi.split('#', 1)[1]
-    # Normalize separators to commas
-    roi = roi.replace('|', ',').replace(';', ',')
-    parts = [p.strip() for p in roi.split(',') if p.strip()]
-    if len(parts) != 3:
-        raise ValueError("ROI must have three parts: 'x0:x1,y0:y1,z0:z1' (CloudVolume x,y,z order)")
 
-    def _parse_part(p: str) -> slice:
-        a, b = p.split(':')
-        return slice(int(a), int(b))
+    roi = roi.strip()
+    if not roi:
+        return None
 
-    x, y, z = map(_parse_part, parts)
-    return [x, y, z]
+    # 1) Legacy format: comma-separated axes with colon ranges (assumed x,y,z).
+    #    Examples: "0:10,20:30,40:50" or with alternate separators ';' or '|'.
+    if (':' in roi) and (',' in roi or ';' in roi or '|' in roi):
+        norm = roi.replace('|', ',').replace(';', ',')
+        parts = [p.strip() for p in norm.split(',') if p.strip()]
+        if len(parts) != 3:
+            raise ValueError("ROI must have three parts in legacy format 'x0:x1,y0:y1,z0:z1'.")
+
+        def _parse_ab(part: str) -> slice:
+            a, b = part.split(':')
+            return slice(int(a), int(b))
+
+        xsl, ysl, zsl = map(_parse_ab, parts)
+        return [xsl, ysl, zsl]
+
+    # 2) New format: underscore-separated axes with hyphen ranges (assumed z,y,x).
+    #    Examples: "0-10_20-30_40-50" corresponds to (z,y,x).
+    if '_' in roi and '-' in roi:
+        parts = [p.strip() for p in roi.split('_') if p.strip()]
+        if len(parts) != 3:
+            raise ValueError("ROI must have three parts in new format 'z0-z1_y0-y1_x0-x1'.")
+
+        def _parse_ab(part: str) -> slice:
+            a, b = part.split('-')
+            return slice(int(a), int(b))
+
+        zsl, ysl, xsl = map(_parse_ab, parts)
+        # Return in CloudVolume (x,y,z) order
+        return [xsl, ysl, zsl]
+
+    # If neither pattern matched, raise with helpful guidance
+    raise ValueError(
+        "Unsupported ROI format. Use either 'x0:x1,y0:y1,z0:z1' (legacy, x,y,z) "
+        "or 'z0-z1_y0-y1_x0-x1' (new, z,y,x)."
+    )
 
 
 def _maybe_reorder_channels(arr: np.ndarray, drop_channel: bool=False) -> np.ndarray:
