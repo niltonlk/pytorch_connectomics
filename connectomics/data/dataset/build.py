@@ -82,6 +82,12 @@ def _get_file_list(name: Union[str, List[str]],
             prefix, name), recursive=True))
         return [os.path.relpath(x, prefix) for x in filelist]
 
+    # Do not split on '@' for URL-like sources where '@' has semantic meaning
+    # (e.g., precomputed MIP selection: precomputed://...@1#roi)
+    if name.startswith(('precomputed://', 'gs://', 's3://', 'file://', 'http://', 'https://')):
+        return [name]
+
+    # Otherwise, support using '@' as a delimiter to list multiple inputs
     return name.split('@')
 
 
