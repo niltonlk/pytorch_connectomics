@@ -225,7 +225,7 @@ def readvol_ome_zarr(path: str, dataset: Optional[str]=None, drop_channel: bool=
     return data
 
 
-def readvol_precomputed(source: str, roi_spec: Optional[str]=None, drop_channel: bool=False, mip: int=0) -> np.ndarray:
+def readvol_precomputed(source: str, roi_spec: Optional[Union[str, List[str]]]=None, drop_channel: bool=False, mip: int=0) -> np.ndarray:
     """Read a Neuroglancer 'precomputed' volume using CloudVolume.
 
     To avoid accidental massive downloads, an ROI must be provided either:
@@ -242,6 +242,18 @@ def readvol_precomputed(source: str, roi_spec: Optional[str]=None, drop_channel:
     """
     if CloudVolume is None:
         raise ImportError("cloud-volume is required to read 'precomputed' sources. Install 'cloud-volume' and retry.")
+
+    # Handle roi_spec as list (from multi-volume configs) - take last non-empty element
+    if isinstance(roi_spec, list):
+        roi_spec = next((s for s in reversed(roi_spec) if s and s.strip()), None)
+
+    # Parse MIP level from roi_spec if format is "N#roi" (e.g., "1#x0:x1,y0:y1,z0:z1")
+    if roi_spec and '#' in str(roi_spec) and not roi_spec.startswith('#'):
+        # Check if it's "mip#roi" format (e.g., "1#139456:142016,...")
+        first_part = roi_spec.split('#')[0]
+        if first_part.isdigit():
+            mip_str, roi_spec = roi_spec.split('#', 1)
+            mip = int(mip_str)
 
     # Parse MIP level from URL if present (e.g., precomputed://...@2#roi)
     url, anchor = source, None
