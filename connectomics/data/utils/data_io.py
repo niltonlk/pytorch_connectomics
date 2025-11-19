@@ -407,16 +407,68 @@ def write_ome_zarr(filename: str, vol: np.ndarray, dataset: Optional[str] = None
             # For 4D: keep channels together, chunk spatially
             chunks = (vol.shape[0],) + tuple(min(64, s) for s in vol.shape[1:])
     
-    # Create the zarr array
-    arr = store.create_dataset(
-        dataset,
+    # Create the zarr array, supporting both zarr v2 and v3 APIs
+    create_kwargs = dict(
         shape=array_shape,
         dtype=vol.dtype,
         chunks=chunks,
-        compression=compression,
-        overwrite=True
+        overwrite=True,
     )
+
+    # Map 'compression' string to a numcodecs compressor when possible (zarr v2)
+    comp_obj = None
+    if compression is not None:
+        try:
+            # Prefer numcodecs compressors for zarr v2
+            from numcodecs import Blosc, GZip, Zlib  # type: ignore
+            comp = str(compression).lower()
+            if comp in ("blosc", "blosc:zstd", "zstd"):
+                # Default Blosc config (ZSTD) is commonly used
+                comp_obj = Blosc(cname='zstd', clevel=5, shuffle=Blosc.SHUFFLE)
+            elif comp in ("gzip", "gz"):
+                comp_obj = GZip(level=5)
+            elif comp in ("zlib", "deflate"):
+                comp_obj = Zlib(level=5)
+            else:
+                # Unknown compression string; ignore and let zarr default
+                comp_obj = None
+        except Exception:
+            # numcodecs not available or zarr v3 path; fall back to defaults
+            comp_obj = None
+
+    arr = None
+    # Try zarr v2-style create with 'compressor='
+    try:
+        if comp_obj is not None:
+            arr = store.create_dataset(
+                dataset,
+                compressor=comp_obj,
+                **create_kwargs,
+            )
+        else:
+            arr = store.create_dataset(
+                dataset,
+                **create_kwargs,
+            )
+    except TypeError:
+        # Likely zarr v3 AsyncGroup which doesn't accept 'compressor'/'compression'.
+        # Retry with minimal args so defaults are used.
+        arr = store.create_dataset(
+            dataset,
+            **create_kwargs,
+        )
     arr[:] = vol
+
+    # Name dimensions explicitly for better interoperability (e.g., xarray/napari)
+    # Use standard order: 3D -> ["z","y","x"], 4D -> ["c","z","y","x"]
+    try:
+        if vol.ndim == 3:
+            arr.attrs["_ARRAY_DIMENSIONS"] = ["z", "y", "x"]
+        elif vol.ndim == 4:
+            arr.attrs["_ARRAY_DIMENSIONS"] = ["c", "z", "y", "x"]
+    except Exception:
+        # Attribute setting is best-effort; ignore if store forbids attrs
+        pass
     
     # Add OME-NGFF multiscales metadata if requested
     if multiscale:
