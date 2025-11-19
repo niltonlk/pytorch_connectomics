@@ -225,7 +225,7 @@ def readvol_ome_zarr(path: str, dataset: Optional[str]=None, drop_channel: bool=
     return data
 
 
-def readvol_precomputed(source: str, roi_spec: Optional[Union[str, List[str]]]=None, drop_channel: bool=False, mip: int=0) -> np.ndarray:
+def readvol_precomputed(source: str, roi_spec: Optional[str]=None, drop_channel: bool=False, mip: int=0) -> np.ndarray:
     """Read a Neuroglancer 'precomputed' volume using CloudVolume.
 
     To avoid accidental massive downloads, an ROI must be provided either:
@@ -242,18 +242,6 @@ def readvol_precomputed(source: str, roi_spec: Optional[Union[str, List[str]]]=N
     """
     if CloudVolume is None:
         raise ImportError("cloud-volume is required to read 'precomputed' sources. Install 'cloud-volume' and retry.")
-
-    # Handle roi_spec as list (from multi-volume configs) - take last non-empty element
-    if isinstance(roi_spec, list):
-        roi_spec = next((s for s in reversed(roi_spec) if s and s.strip()), None)
-
-    # Parse MIP level from roi_spec if format is "N#roi" (e.g., "1#x0:x1,y0:y1,z0:z1")
-    if roi_spec and '#' in str(roi_spec) and not roi_spec.startswith('#'):
-        # Check if it's "mip#roi" format (e.g., "1#139456:142016,...")
-        first_part = roi_spec.split('#')[0]
-        if first_part.isdigit():
-            mip_str, roi_spec = roi_spec.split('#', 1)
-            mip = int(mip_str)
 
     # Parse MIP level from URL if present (e.g., precomputed://...@2#roi)
     url, anchor = source, None
@@ -301,10 +289,99 @@ def readvol_precomputed(source: str, roi_spec: Optional[Union[str, List[str]]]=N
     return data
 
 
+def write_ome_zarr(filename: str, vol: np.ndarray, dataset: Optional[str] = None,
+                   chunks: Optional[tuple] = None, compression: str = 'blosc',
+                   multiscale: bool = False) -> None:
+    """Write a volume as OME-Zarr format.
+    
+    Args:
+        filename: Path to output .zarr or .ome.zarr file
+        vol: Volume to save, expected as (z,y,x) or (c,z,y,x)
+        dataset: Dataset name within the zarr store (e.g., '0' for multiscale level 0)
+        chunks: Chunk size for zarr array. If None, uses zarr's auto-chunking.
+        compression: Compression algorithm. Default 'blosc'.
+        multiscale: If True, creates OME-NGFF multiscales metadata for level 0.
+    """
+    if zarr is None:
+        raise ImportError("zarr is required to write OME-Zarr volumes. Install 'zarr' and retry.")
+    
+    # Ensure filename ends with .zarr or .ome.zarr
+    if not (filename.endswith('.zarr') or filename.endswith('.ome.zarr')):
+        filename = filename + '.ome.zarr'
+    
+    # Open or create zarr store
+    store = zarr.open(filename, mode='a')  # 'a' = read/write, create if doesn't exist
+    
+    # Determine dataset key
+    if dataset is None:
+        dataset = '0' if multiscale else 'volume'
+    
+    # Handle channel dimension: ensure (z,y,x) or (c,z,y,x)
+    if vol.ndim == 3:
+        # (z,y,x) - single channel, typical for segmentation
+        shape = vol.shape
+        array_shape = shape
+    elif vol.ndim == 4:
+        # (c,z,y,x) - multi-channel
+        shape = vol.shape
+        array_shape = shape
+    else:
+        raise ValueError(f"Expected 3D (z,y,x) or 4D (c,z,y,x) volume, got {vol.ndim}D")
+    
+    # Default chunks if not specified
+    if chunks is None:
+        if vol.ndim == 3:
+            # For 3D: chunk in reasonable sizes (e.g., 64^3)
+            chunks = tuple(min(64, s) for s in vol.shape)
+        else:
+            # For 4D: keep channels together, chunk spatially
+            chunks = (vol.shape[0],) + tuple(min(64, s) for s in vol.shape[1:])
+    
+    # Create the zarr array
+    arr = store.create_dataset(
+        dataset,
+        shape=array_shape,
+        dtype=vol.dtype,
+        chunks=chunks,
+        compression=compression,
+        overwrite=True
+    )
+    arr[:] = vol
+    
+    # Add OME-NGFF multiscales metadata if requested
+    if multiscale:
+        multiscales_meta = [{
+            "version": "0.4",
+            "name": dataset,
+            "axes": [
+                {"name": "z", "type": "space", "unit": "micrometer"},
+                {"name": "y", "type": "space", "unit": "micrometer"},
+                {"name": "x", "type": "space", "unit": "micrometer"}
+            ] if vol.ndim == 3 else [
+                {"name": "c", "type": "channel"},
+                {"name": "z", "type": "space", "unit": "micrometer"},
+                {"name": "y", "type": "space", "unit": "micrometer"},
+                {"name": "x", "type": "space", "unit": "micrometer"}
+            ],
+            "datasets": [{
+                "path": dataset,
+                "coordinateTransformations": [{
+                    "type": "scale",
+                    "scale": [1.0] * vol.ndim
+                }]
+            }]
+        }]
+        store.attrs['multiscales'] = multiscales_meta
+    
+    print(f"Saved volume to OME-Zarr: {filename}/{dataset}, shape={vol.shape}, dtype={vol.dtype}")
+
+
 def savevol(filename, vol, dataset='main', format='h5'):
     if format == 'h5':
         writeh5(filename, vol, dataset='main')
-    if format == 'png':
+    elif format == 'zarr' or format == 'ome-zarr':
+        write_ome_zarr(filename, vol, dataset=dataset)
+    elif format == 'png':
         currentDirectory = os.getcwd()
         img_save_path = os.path.join(currentDirectory, filename)
         if not os.path.exists(img_save_path):

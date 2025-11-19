@@ -22,7 +22,7 @@ from ..utils.monitor import build_monitor
 from ..data.augmentation import build_train_augmentor, TestAugmentor
 from ..data.dataset import build_dataloader, get_dataset
 from ..data.dataset.build import _get_file_list
-from ..data.utils import build_blending_matrix, writeh5, read_pkl
+from ..data.utils import build_blending_matrix, writeh5, write_ome_zarr, read_pkl
 from ..data.utils import get_padsize, array_unpad
 
 
@@ -278,8 +278,18 @@ class Trainer(TrainerBase):
             if not os.path.exists(self.output_dir):
                 os.makedirs(self.output_dir)
             save_path = os.path.join(self.output_dir, self.test_filename)
-            writeh5(save_path, result, ['vol%d' % (x) for x in range(len(result))])
-            print('Prediction saved as: ', save_path)
+            
+            # Determine output format from filename extension
+            if save_path.endswith('.zarr') or save_path.endswith('.ome.zarr'):
+                # Save as OME-Zarr: one dataset per volume
+                for vol_id, vol_data in enumerate(result):
+                    dataset_name = 'vol%d' % vol_id
+                    write_ome_zarr(save_path, vol_data, dataset=dataset_name, multiscale=True)
+                print('Prediction saved as OME-Zarr: ', save_path)
+            else:
+                # Default: save as HDF5
+                writeh5(save_path, result, ['vol%d' % (x) for x in range(len(result))])
+                print('Prediction saved as: ', save_path)
 
     def test_singly(self):        
         dir_name = None
