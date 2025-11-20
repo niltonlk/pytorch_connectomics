@@ -482,16 +482,40 @@ def write_ome_zarr(filename: str, vol: np.ndarray, dataset: Optional[str] = None
         # Attribute setting is best-effort; ignore if store forbids attrs
         pass
     
-    # Add Neuroglancer resolution metadata if available
-    # Neuroglancer expects resolution in nanometers in [x,y,z] order at array level
-    if resolution is not None:
+    # Add Neuroglancer resolution and offset metadata
+    # Neuroglancer expects these at both array level AND root group level
+    # Resolution in nanometers [x,y,z] order, offset in voxels [x,y,z] order
+    if resolution is not None or offset is not None:
         try:
-            # resolution is in (z,y,x) nm, convert to [x,y,z] for Neuroglancer
-            ng_resolution = [resolution[2], resolution[1], resolution[0]]
-            if vol.ndim == 4:
-                # For 4D, prepend channel resolution (usually 1)
-                ng_resolution = [1.0] + ng_resolution
-            arr.attrs["resolution"] = ng_resolution
+            # Build resolution array
+            ng_resolution = None
+            if resolution is not None:
+                # resolution is in (z,y,x) nm, convert to [x,y,z] for Neuroglancer
+                ng_resolution = [resolution[2], resolution[1], resolution[0]]
+                if vol.ndim == 4:
+                    # For 4D, prepend channel resolution (usually 1)
+                    ng_resolution = [1.0] + ng_resolution
+            
+            # Build offset array
+            ng_offset = None
+            if offset is not None:
+                # offset is in (z,y,x) voxels, convert to [x,y,z] for Neuroglancer
+                ng_offset = [offset[2], offset[1], offset[0]]
+                if vol.ndim == 4:
+                    # For 4D, prepend channel offset (usually 0)
+                    ng_offset = [0.0] + ng_offset
+            
+            # Set on array
+            if ng_resolution is not None:
+                arr.attrs["resolution"] = ng_resolution
+            if ng_offset is not None:
+                arr.attrs["offset"] = ng_offset
+            
+            # ALSO set on root group for Neuroglancer
+            if ng_resolution is not None:
+                store.attrs["resolution"] = ng_resolution
+            if ng_offset is not None:
+                store.attrs["offset"] = ng_offset
         except Exception:
             pass
     
