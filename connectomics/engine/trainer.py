@@ -252,10 +252,16 @@ class Trainer(TrainerBase):
             if result[vol_id].ndim > weight[vol_id].ndim:
                 weight[vol_id] = np.expand_dims(weight[vol_id], axis=0)
             result[vol_id] /= weight[vol_id]  # in-place to save memory
-            # remoe negative part for quantization
-            result[vol_id][result[vol_id]<0] = 0
-            result[vol_id] *= 255
-            result[vol_id] = result[vol_id].astype(np.uint8)
+            # Postprocess dtype according to inference setting
+            output_dtype = getattr(self.cfg.INFERENCE, "OUTPUT_DTYPE", "float32")
+            if output_dtype == "uint8":
+                # Remove negative part for quantization
+                result[vol_id][result[vol_id] < 0] = 0
+                result[vol_id] = np.clip(result[vol_id] * 255, 0, 255).astype(np.uint8)
+            elif output_dtype == "float32":
+                result[vol_id] = result[vol_id].astype(np.float32)
+            else:
+                raise ValueError(f"Unsupported INFERENCE.OUTPUT_DTYPE: {output_dtype}")
 
             if self.cfg.INFERENCE.UNPAD:
                 pad_size = (np.array(self.cfg.DATASET.PAD_SIZE) *

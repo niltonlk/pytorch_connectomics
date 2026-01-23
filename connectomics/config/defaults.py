@@ -479,6 +479,7 @@ _C.INFERENCE.INPUT_PATH = None
 _C.INFERENCE.IMAGE_NAME = None
 _C.INFERENCE.OUTPUT_PATH = ""
 _C.INFERENCE.OUTPUT_NAME = 'result.h5'
+_C.INFERENCE.OUTPUT_DTYPE = 'float32'  # default to keep raw scores; set to 'uint8' for legacy 8-bit
 _C.INFERENCE.IS_ABSOLUTE_PATH = None
 _C.INFERENCE.DO_CHUNK_TITLE = None
 
