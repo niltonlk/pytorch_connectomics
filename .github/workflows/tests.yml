@@ -27,6 +27,7 @@ jobs:
         python -m pip install --upgrade pip
         pip install pytest pytest-cov
         pip install zarr optuna
+        pip install git+https://github.com/PytorchConnectomics/em_erl.git
         pip install -e .
 
     - name: Validate tutorial configs
