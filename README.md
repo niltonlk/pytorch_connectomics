@@ -132,6 +132,42 @@ just resume my_mito <pretrained.ckpt>
 just test my_mito <ckpt> evaluation.enabled=false
 ```
 
+### Save inference outputs as Zarr or Neuroglancer precomputed
+
+Use `inference.save_results=true` and choose one or more backends in
+`inference.save_backend`.
+
+```bash
+# Zarr output
+python scripts/main.py --config tutorials/mito_lucchi++.yaml --mode test --checkpoint <ckpt> \
+    evaluation.enabled=false \
+    inference.save_results=true \
+    inference.save_backend=zarr
+
+# Neuroglancer precomputed output
+python scripts/main.py --config tutorials/mito_lucchi++.yaml --mode test --checkpoint <ckpt> \
+    evaluation.enabled=false \
+    inference.save_results=true \
+    inference.save_backend=neuroglancer_precomputed
+
+# Multiple outputs in one run
+python scripts/main.py --config tutorials/mito_lucchi++.yaml --mode test --checkpoint <ckpt> \
+    evaluation.enabled=false \
+    inference.save_results=true \
+    inference.save_backend=h5,zarr,neuroglancer_precomputed
+```
+
+Per-volume output layout under `inference.save_path`:
+
+- HDF5: `<save_path>/<volume_stem>/prediction.h5`
+- Zarr: `<save_path>/<volume_stem>/prediction.zarr`
+- Neuroglancer precomputed: `<save_path>/<volume_stem>/prediction.precomputed/`
+
+Notes:
+
+- Neuroglancer precomputed export currently writes a single-scale `raw` volume.
+- The precomputed writer currently supports 3D volumes.
+
 **5. Sweep decode params with Optuna:**
 
 ```bash

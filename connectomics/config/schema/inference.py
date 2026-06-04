@@ -210,7 +210,9 @@ class InferenceConfig:
     )
     save_all_heads: bool = False
     save_dtype: Optional[str] = None
-    save_backend: str = "h5"  # "h5", "zarr", or "tensorstore" when implemented by runtime.
+    save_backend: str = (
+        "h5"  # "h5", "zarr", "neuroglancer_precomputed", or comma-separated combinations.
+    )
     save_compression: Optional[str] = "gzip"
 
     # Runtime aliases consumed by existing stage code after sync.

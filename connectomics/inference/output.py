@@ -16,6 +16,165 @@ from ..data.processing.nnunet_preprocess import restore_prediction_to_input_spac
 logger = logging.getLogger(__name__)
 
 
+def _resolve_output_formats(inference_cfg: Any) -> List[str]:
+    """Normalize ``inference.save_backend`` to a non-empty list of backend names."""
+    backend = getattr(inference_cfg, "save_backend", "h5")
+
+    if isinstance(backend, (list, tuple)):
+        formats = [str(item).strip() for item in backend if str(item).strip()]
+        return formats or ["h5"]
+
+    backend_str = str(backend).strip()
+    if not backend_str:
+        return ["h5"]
+
+    if "," in backend_str:
+        formats = [part.strip() for part in backend_str.split(",") if part.strip()]
+        return formats or ["h5"]
+
+    return [backend_str]
+
+
+def _write_neuroglancer_precomputed(
+    output_dir: Path,
+    artifact_stem: str,
+    sample: np.ndarray,
+    *,
+    resolution_xyz: tuple[float, float, float],
+) -> Path:
+    """Write one 3D/4D volume as single-scale Neuroglancer precomputed (raw encoding).
+
+    The writer exports a single chunk and records voxel resolution in xyz order.
+    Supported layouts:
+    - ``(Z, Y, X)`` (single-channel)
+    - ``(C, Z, Y, X)`` (channel-first multi-channel)
+    """
+    if sample.ndim not in (3, 4):
+        raise ValueError(
+            "Neuroglancer precomputed export supports (Z,Y,X) or (C,Z,Y,X) "
+            f"(got shape {sample.shape})."
+        )
+
+    dtype_name = np.dtype(sample.dtype).name
+    if dtype_name not in {
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "float32",
+        "float64",
+    }:
+        raise ValueError(
+            "Unsupported dtype for Neuroglancer precomputed export: "
+            f"{sample.dtype}."
+        )
+
+    if sample.ndim == 3:
+        num_channels = 1
+        z, y, x = (int(v) for v in sample.shape)
+    else:
+        num_channels = int(sample.shape[0])
+        z, y, x = (int(v) for v in sample.shape[1:])
+        if num_channels < 1:
+            raise ValueError("Neuroglancer precomputed requires at least one channel.")
+
+    out_dir = output_dir / f"{artifact_stem}.precomputed"
+
+    try:
+        from cloudvolume import CloudVolume
+    except Exception as exc:
+        raise ModuleNotFoundError(
+            "CloudVolume is required for neuroglancer_precomputed export. "
+            "Install cloud-volume>=11.0.0."
+        ) from exc
+
+    info = CloudVolume.create_new_info(
+        num_channels=num_channels,
+        layer_type="image",
+        data_type=dtype_name,
+        encoding="raw",
+        resolution=list(resolution_xyz),
+        voxel_offset=[0, 0, 0],
+        chunk_size=[x, y, z],
+        volume_size=[x, y, z],
+    )
+    vol = CloudVolume(
+        f"file://{out_dir}",
+        info=info,
+        compress=False,
+        progress=False,
+        parallel=False,
+        fill_missing=True,
+    )
+    vol.commit_info()
+    vol.commit_provenance()
+
+    # CloudVolume expects XYZC order for image layers.
+    if sample.ndim == 3:
+        data_xyzc = np.ascontiguousarray(sample.transpose(2, 1, 0)[..., np.newaxis])
+    else:
+        data_xyzc = np.ascontiguousarray(sample.transpose(3, 2, 1, 0))
+    vol[:, :, :] = data_xyzc
+    return out_dir
+
+
+def _resolve_output_resolution_zyx(data_cfg: Any, mode: str) -> tuple[float, float, float]:
+    """Resolve voxel resolution from merged data config as ZYX spacing."""
+    if data_cfg is None:
+        return (1.0, 1.0, 1.0)
+
+    section = getattr(data_cfg, mode, None)
+    resolution = getattr(section, "resolution", None) if section is not None else None
+    if resolution is None:
+        resolution = getattr(data_cfg, "resolution", None)
+
+    if resolution is None:
+        return (1.0, 1.0, 1.0)
+
+    values = tuple(float(v) for v in resolution)
+    if len(values) != 3:
+        logger.warning(
+            f"Expected 3D resolution for output metadata, got {resolution!r}; "
+            "falling back to [1,1,1]."
+        )
+        return (1.0, 1.0, 1.0)
+    return values
+
+
+def _write_zarr_attrs(
+    out_path: Path,
+    sample: np.ndarray,
+    *,
+    resolution_zyx: tuple[float, float, float],
+) -> None:
+    """Attach standard metadata attrs to zarr prediction arrays."""
+    try:
+        import zarr
+
+        arr = zarr.open(str(out_path), mode="a")
+        num_channels = int(sample.shape[0]) if sample.ndim == 4 else 1
+        arr.attrs["kind"] = "raw_prediction"
+        arr.attrs["layout"] = "CZYX" if sample.ndim == 4 else "ZYX"
+        arr.attrs["num_channels"] = num_channels
+        arr.attrs["resolution_zyx"] = [
+            float(resolution_zyx[0]),
+            float(resolution_zyx[1]),
+            float(resolution_zyx[2]),
+        ]
+        arr.attrs["resolution_xyz"] = [
+            float(resolution_zyx[2]),
+            float(resolution_zyx[1]),
+            float(resolution_zyx[0]),
+        ]
+        arr.attrs["axes"] = "czyx" if sample.ndim == 4 else "zyx"
+    except Exception as exc:
+        logger.warning(f"Failed to attach zarr attrs for {out_path.name}: {exc}")
+
+
 def resolve_output_filenames(
     cfg: Config | DictConfig, batch: Dict[str, Any], global_step: int = 0
 ) -> List[str]:
@@ -268,7 +427,7 @@ def write_outputs(
     Note: output_transpose is NOT applied here. It is applied once in the
     decoding stage to avoid double-transpose when decoded data are then saved.
     """
-    inference_cfg, _data_cfg, output_dir_value = _resolve_mode_configs(cfg, mode)
+    inference_cfg, data_cfg, output_dir_value = _resolve_mode_configs(cfg, mode)
     if inference_cfg is None:
         return
 
@@ -304,6 +463,8 @@ def write_outputs(
     )
 
     artifact_stem = _strip_extension(suffix)
+    resolution_zyx = _resolve_output_resolution_zyx(data_cfg, mode)
+    resolution_xyz = (resolution_zyx[2], resolution_zyx[1], resolution_zyx[0])
 
     for idx in range(actual_batch_size):
         if idx >= len(filenames):
@@ -318,8 +479,7 @@ def write_outputs(
         volume_stem = filenames[idx]
         sample = np.squeeze(sample)
 
-        backend = str(getattr(inference_cfg, "save_backend", "h5"))
-        output_formats = [backend]
+        output_formats = _resolve_output_formats(inference_cfg)
 
         sample = apply_storage_dtype_transform(cfg, sample)
 
@@ -352,6 +512,32 @@ def write_outputs(
                 except Exception as exc:
                     logger.warning(f"NIfTI export failed: {exc}")
 
+            elif fmt_lower == "zarr":
+                out_path = volume_dir / f"{artifact_stem}.zarr"
+                try:
+                    save_volume(str(out_path), sample, file_format="zarr")
+                    _write_zarr_attrs(out_path, sample, resolution_zyx=resolution_zyx)
+                    logger.info(f"Saved Zarr: {volume_stem}/{out_path.name}")
+                except Exception as exc:
+                    logger.warning(f"Zarr export failed: {exc}")
+
+            elif fmt_lower in [
+                "neuroglancer_precomputed",
+                "precomputed",
+                "neuroglancer",
+                "ng_precomputed",
+            ]:
+                try:
+                    out_path = _write_neuroglancer_precomputed(
+                        volume_dir,
+                        artifact_stem,
+                        sample,
+                        resolution_xyz=resolution_xyz,
+                    )
+                    logger.info(f"Saved Neuroglancer precomputed: {volume_stem}/{out_path.name}/")
+                except Exception as exc:
+                    logger.warning(f"Neuroglancer precomputed export failed: {exc}")
+
             elif fmt_lower == "png":
                 out_dir = volume_dir / f"{artifact_stem}_png"
                 try:
@@ -362,7 +548,9 @@ def write_outputs(
 
             else:
                 logger.warning(
-                    f"Unknown format '{fmt}' - skipping. Supported: h5, tiff, nii.gz, png"
+                    "Unknown format '%s' - skipping. Supported: h5, zarr, tiff, "
+                    "nii.gz, png, neuroglancer_precomputed"
+                    % fmt
                 )
 
 

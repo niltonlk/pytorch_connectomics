@@ -24,6 +24,7 @@ requirements = [
     "opencv-python>=4.3.0",
     "h5py>=2.10.0",
     "imageio>=2.9.0",
+    "zarr>=2.18.0",
     # Visualization & logging
     "matplotlib>=3.3.0",
     "tensorboard>=2.2.2",
@@ -35,6 +36,8 @@ requirements = [
     "connected-components-3d>=3.0.0",  # imports as 'cc3d'
     "fastremap>=1.10.0",  # Fast remapping for segmentation labels
     "kimimaro>=1.0.0",  # Skeletonization library
+    "osteoid<0.7",  # kimimaro compatibility: osteoid 0.7.x misses formats module
+    "cloud-volume>=11.0.0",  # robust neuroglancer_precomputed writer
     "crackle-codec>=0.1.0",  # Required by kimimaro for compression
     "mahotas>=1.4.0",  # Image processing (morphological operations, connected components)
     # Build tools
