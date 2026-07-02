@@ -49,6 +49,7 @@ except ImportError:
 # Import MedNeXt models to trigger registration
 try:
     from . import mednext_models  # noqa: F401
+    from . import mednext_autocontext  # noqa: F401
 
     _MEDNEXT_AVAILABLE = True
 except ImportError:
@@ -56,6 +57,9 @@ except ImportError:
 
 # Import RSUNet models (always available - pure PyTorch)
 from . import rsunet  # noqa: F401
+
+# Import the generic auto-context cascade (registers rsunet_aclsd; pure PyTorch)
+from . import autocontext  # noqa: F401
 
 # Import nnUNet models to trigger registration
 try:

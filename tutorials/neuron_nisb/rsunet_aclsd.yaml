@@ -1,0 +1,83 @@
+_base_:
+  - base_banis+.yaml
+
+experiment_name: nisb_rsunet_aclsd
+description: >-
+  Auto-context LSD cascade on an RSUNet backbone (ACRLSD). Stage 1 predicts a
+  10-channel 3D LSD from the raw image; the sigmoided LSD is concatenated with
+  the raw image and fed to stage 2, which predicts the 6-channel aff-1+aff-10
+  affinity. Both stages are supervised in one end-to-end run: the 'lsd' head
+  against the LSD target [6:16] and the 'aff' head against the affinity target
+  [0:6]. detach_stage1 keeps the two stages decoupled (paper-like). Decoding
+  consumes the aff head's short-range channels [0:3].
+
+save_path: outputs/nisb_rsunet_aclsd
+
+default:
+  model:
+    arch:
+      type: rsunet_aclsd
+      params:
+        lsd_channels: 10        # 3D LSD width
+        aff_channels: 6         # affinity head width
+        include_raw: true       # true -> ACRLSD, false -> ACLSD
+        detach_stage1: true     # decouple stage 1 from the affinity gradients
+        freeze_stage1: false    # set true (+ stage1_weights_path) for the frozen paper setup
+    in_channels: 1
+    out_channels: 6             # = aff_channels (single-tensor fallback width)
+    primary_head: aff
+    rsunet:
+      width: [28, 36, 48, 64, 80]
+      norm: group               # GroupNorm keeps a frozen stage 1 statistics-free
+      num_groups: 8
+      activation: elu
+      down_factors: [[1, 2, 2], [1, 2, 2], [1, 2, 2], [1, 2, 2]]
+    loss:
+      deep_supervision: false
+      losses:
+        - function: PerChannelBCEWithLogitsLoss
+          weight: 1.0
+          pred_head: aff
+          target_slice: "0:6"
+          kwargs:
+            auto_pos_weight: true
+            max_pos_weight: 10.0
+        # LSD targets are normalized to [0, 1]; BCEWithLogits on raw head logits
+        # is the simplest stable supervision (equivalent in behavior to the
+        # funkelab/lsd sigmoid + MSE reference in low-error regions).
+        - function: WeightedBCEWithLogitsLoss
+          weight: 1.0
+          pred_head: lsd
+          target_slice: "6:16"
+  data:
+    label_transform:
+      targets:
+        - name: affinity
+          kwargs:
+            offsets: ["1-0-0", "0-1-0", "0-0-1", "10-0-0", "0-10-0", "0-0-10"]
+            affinity_mode: banis
+        - name: lsd
+          kwargs:
+            # Isotropic sigma in voxel units (~80 nm context at 9 nm xy).
+            sigma: 8
+  inference:
+    model:
+      head: aff
+      select_channel: [0, 1, 2]
+    save_all_heads: true
+
+train:
+  monitor:
+    logging:
+      scalar:
+        loss:
+          - train_loss_total_epoch
+          - val_loss_total
+          - train_loss_term_0_raw
+          - train_loss_term_0_weighted
+          - train_loss_term_1_raw
+          - train_loss_term_1_weighted
+        loss_every_n_steps: 100
+      images:
+        head: all
+        channel_mode: all
