@@ -24,10 +24,11 @@
 | Cell-scale      | Neurons         | SNEMI3D, BANIS, LiConn-MIT                  | `neuron_snemi/*`, `neuron_nisb/*`, `neuron_liconn_mit`           |
 | Cell-scale      | Synapses        | CREMI                                       | `syn_cremi`                                                      |
 | Cell-scale      | Fibers          | Linghu26                                    | `fiber_linghu26`                                                 |
-| Organelle-scale | Mitochondria    | Lucchi++, MitoEM, MitoLab, BetaSeg          | `mito_lucchi++`, `mitoEM/*`, `mito_mitolab`, `mito_betaseg`      |
+| Organelle-scale | Mitochondria    | Lucchi++, MitoEM, MitoLab, BetaSeg          | `mito_lucchi++/mito_lucchi++`, `mitoEM/*`, `mito_mitolab`, `mito_betaseg` |
 | Organelle-scale | Vesicles        | XM                                          | `vesicle_xm`                                                     |
 
-Sample data downloads in <1 min for `lucchi++`, `snemi`, `mitoem`, `cremi` (`just download <name>`).
+Download sample data for `lucchi++`, `snemi`, `mitoem`, or `cremi` with
+`just download <name>`.
 
 ---
 
@@ -38,10 +39,10 @@ checkpoints live in **[`docs/benchmarks/`](docs/benchmarks/)**.
 
 | Dataset   | Task                    | Architecture       | Metric          | Score |
 |-----------|-------------------------|--------------------|-----------------|-------|
-| Lucchi++  | Mito — semantic         | MedNeXt-S          | Jaccard ↑       | [0.935](https://huggingface.co/pytc/tutorial/tree/main/mito_lucchi++) |
+| Lucchi++  | Mito — semantic         | MedNeXt-S          | Jaccard ↑       | [0.935](https://huggingface.co/pytc/tutorial/tree/main/mito_lucchi%2B%2B) |
 | MitoEM-R  | Mito — instance         | MedNeXt-L + waterz | AP ↑            | —     |
-| SNEMI3D   | Neurons — instance      | RSUNet + waterz    | adapted Rand ↓  | —     |
-| BANIS     | Neurons — instance      | MedNeXt-M + abiss  | NERL ↑          | —     |
+| SNEMI3D   | Neurons — instance      | MedNeXt-S + waterz | adapted Rand ↓  | —     |
+| BANIS     | Neurons — instance      | MedNeXt-L + cc3d   | NERL ↑          | [0.601](https://huggingface.co/pytc/tutorial/tree/main/neuron_nisb) |
 | CREMI     | Synapse — semantic      | MONAI U-Net        | F1 ↑            | —     |
 
 <!-- Maintainer TODO: replace "—" with current scores from the latest released
@@ -98,16 +99,16 @@ python scripts/main.py --demo
 **1. Train + evaluate on a built-in benchmark** — sample data is tiny:
 
 ```bash
-just download lucchi++              # ~50 MB
-just train     mito_lucchi++        # train from scratch
-just test      mito_lucchi++ <ckpt> # infer + decode + evaluate
-just tensorboard mito_lucchi++      # monitor
+just download lucchi++                             # ~211 MiB
+just train     mito_lucchi++/mito_lucchi++        # train from scratch
+just test      mito_lucchi++/mito_lucchi++ <ckpt> # infer + decode + evaluate
+just tensorboard mito_lucchi++                     # monitor
 ```
 
 **2. Train on your own EM volume** — copy the closest tutorial, point at your data:
 
 ```bash
-cp tutorials/mito_lucchi++.yaml tutorials/my_mito.yaml
+cp tutorials/mito_lucchi++/mito_lucchi++.yaml tutorials/my_mito.yaml
 # edit data.{train,val}.{image,label} paths inside my_mito.yaml
 just train my_mito
 ```
@@ -115,7 +116,7 @@ just train my_mito
 …or override on the CLI without copying:
 
 ```bash
-python scripts/main.py --config tutorials/mito_lucchi++.yaml \
+python scripts/main.py --config tutorials/mito_lucchi++/mito_lucchi++.yaml \
     data.train.image=/path/to/train.h5 \
     data.train.label=/path/to/label.h5
 ```
@@ -135,7 +136,7 @@ just test my_mito <ckpt> evaluation.enabled=false
 **5. Sweep decode params with Optuna:**
 
 ```bash
-python scripts/main.py --config tutorials/mito_lucchi++.yaml \
+python scripts/main.py --config tutorials/mito_lucchi++/mito_lucchi++.yaml \
     --mode tune --checkpoint <ckpt>
 ```
 
@@ -177,7 +178,7 @@ python scripts/main.py --config <cfg> data.dataloader.batch_size=4 optimization.
 PyTC stands on the work of many open-source projects. Organized by what they enable here:
 
 - **High-performance pipeline** — [PyTorch Lightning](https://lightning.ai/), [MONAI](https://monai.io/), [Zarr](https://zarr.dev/), [HDF5](https://www.h5py.org/)
-- **State-of-the-art models** — [Swin UNETR](https://docs.monai.io/en/stable/networks.html#swinunetr), [MedNeXt](https://github.com/PytorchConnectomics/MedNeXt), [nnU-Net](https://github.com/MIC-DKFZ/nnUNet), [Cellpose](https://github.com/MouseLand/cellpose)
+- **State-of-the-art models** — [Swin UNETR](https://docs.monai.io/en/stable/networks.html#swinunetr), [MedNeXt](https://github.com/PytorchConnectomics/MedNeXt), [nnU-Net](https://github.com/MIC-DKFZ/nnUNet), [Cellpose](https://github.com/MouseLand/cellpose), [BANIS](https://github.com/StructuralNeurobiologyLab/banis)
 - **Effective decoding** — [cc3d](https://github.com/seung-lab/connected-components-3d), [waterz](https://github.com/funkey/waterz), [abiss](https://github.com/seung-lab/abiss)
 - **Reproducible experiments** — [Hydra](https://hydra.cc/), [Optuna](https://optuna.org/)
 - **Agent-driven development** — [Claude Code](https://claude.com/claude-code), [Codex](https://github.com/openai/codex), orchestrated via [ccc-agent-flow](https://github.com/donglaiw/ccc-agent-flow)

@@ -84,9 +84,56 @@ def test_raw_ref_grammar_preserves_channel_axis():
         on_node_complete=lambda _batch, node, sample: shapes.setdefault(node.name, sample.shape),
     )
 
-    assert shapes["single"] == (1, 2, 3, 4)
+    assert "single" not in shapes
     assert shapes["window"] == (2, 2, 3, 4)
     np.testing.assert_array_equal(result, data[1:3])
+
+
+def test_select_channels_graph_node_selects_and_reorders():
+    data = np.arange(5 * 2 * 3 * 4, dtype=np.float32).reshape(5, 2, 3, 4)
+    graph = DecodeGraph(
+        nodes=[
+            DecodeNode(
+                name="zyx",
+                op="select_channels",
+                inputs=["raw"],
+                kwargs={"channels": [2, 1, 0]},
+            )
+        ],
+        output="zyx",
+    )
+
+    result = run_decode_graph(data, graph)
+
+    np.testing.assert_array_equal(result, data[[2, 1, 0]])
+
+
+def test_output_prunes_downstream_nodes_for_one_line_early_stop():
+    registry = DecoderRegistry()
+    calls = []
+
+    def record(name):
+        def op(data):
+            calls.append(name)
+            return data
+
+        return op
+
+    registry.register("sections", record("sections"))
+    registry.register("tracklets", record("tracklets"))
+    registry.register("split", record("split"))
+    graph = {
+        "nodes": [
+            {"name": "sections", "op": "sections", "inputs": ["raw"]},
+            {"name": "tracklets", "op": "tracklets", "inputs": ["sections"]},
+            {"name": "split", "op": "split", "inputs": ["tracklets"]},
+        ],
+        "output": "tracklets",
+    }
+
+    run_decode_graph(np.zeros((1, 2, 2, 2), dtype=np.float32), graph, registry)
+
+    assert calls == ["sections", "tracklets"]
 
 
 @pytest.mark.parametrize(
@@ -245,9 +292,7 @@ def test_banis2_style_graph_runs_and_combines_common_refinement():
     result = run_decode_graph(
         predictions,
         graph,
-        on_node_complete=lambda _batch, node, sample: captured.setdefault(
-            node.name, sample.copy()
-        ),
+        on_node_complete=lambda _batch, node, sample: captured.setdefault(node.name, sample.copy()),
     )
 
     assert captured["g2"].shape == (3, 5, 5, 5)

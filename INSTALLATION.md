@@ -54,6 +54,22 @@ recreate it.
 system, and `/usr/local/cuda-*`. Passing `--cuda` or `--cpu-only`
 overrides detection.
 
+On Apple silicon, the standard macOS PyTorch wheel includes the MPS backend.
+The installer selects a pthreads OpenBLAS build to avoid loading a second copy
+of `libomp`, and runtime config resolves `system.accelerator: auto` to `mps`.
+Apple MPS is exposed as one device, so use `num_gpus: 1` (or `-1` for automatic
+device count):
+
+```yaml
+system:
+  accelerator: auto  # auto | cpu | cuda | mps
+  num_gpus: 1
+```
+
+PyTC uses full precision on MPS when a tutorial requests mixed precision,
+because PyTorch Lightning's MPS mixed-precision path is not consistently
+supported across macOS/PyTorch releases.
+
 ---
 
 ## Manual install
@@ -190,6 +206,15 @@ module load cuda/12.1
 python -c "import torch; print(torch.cuda.is_available())"
 ```
 
+### macOS aborts with "libomp.dylib already initialized"
+
+Current `install.py` prevents this by selecting pthreads OpenBLAS. For an
+environment created by an older installer, repair it with:
+
+```bash
+conda install -n pytc -c conda-forge 'libopenblas=*=*pthreads*'
+```
+
 ### "ImportError: libcudnn.so.8: cannot open shared object file"
 
 ```bash
@@ -218,5 +243,6 @@ modules and patches `~/.bashrc` to load them automatically. This is
 not part of the canonical install path; use it only if you know your
 cluster's module conventions.
 
-For Docker, see [`docker/Dockerfile`](docker/Dockerfile). The
-container image is not actively maintained beyond CUDA 11.3.
+For Docker, see [`docker/README.md`](docker/README.md). The canonical image is
+built from the repository root, pins an official CUDA-enabled PyTorch base, and
+runs as a non-root user whose UID/GID can be matched to the host.

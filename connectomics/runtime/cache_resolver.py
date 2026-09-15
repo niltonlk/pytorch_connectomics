@@ -119,17 +119,52 @@ def create_decode_only_datamodule(cfg: Config, input_prediction_path: str):
     from torch.utils.data import DataLoader, Dataset
 
     pred_stem = Path(input_prediction_path).stem
+    test_cfg = getattr(getattr(cfg, "data", None), "test", None)
+    label_value = getattr(test_cfg, "label", None)
+    label_path = None
+    if label_value:
+        from connectomics.training.lightning.path_utils import expand_file_paths
+
+        label_paths = expand_file_paths(label_value)
+        if len(label_paths) != 1:
+            raise ValueError(
+                "Decode-only execution expects exactly one data.test.label for "
+                f"{input_prediction_path}, got {len(label_paths)}."
+            )
+        label_path = label_paths[0]
 
     class _DummyDataset(Dataset):
         def __len__(self):
             return 1
 
         def __getitem__(self, idx):
-            return {"image": torch.zeros(1, 1, 1, 1), "filename": pred_stem}
+            sample = {
+                "image": torch.zeros(1, 1, 1, 1),
+                "filename": pred_stem,
+            }
+            if label_path is not None:
+                from connectomics.data.io import read_volume
+
+                sample["label"] = torch.from_numpy(read_volume(label_path, dataset="main"))
+            return sample
 
     class _DummyDataModule(pl.LightningDataModule):
         def test_dataloader(self):
-            return DataLoader(_DummyDataset(), batch_size=1)
+            def _collate_single(samples):
+                sample = samples[0]
+                batch = {
+                    "image": sample["image"].unsqueeze(0),
+                    "filename": [sample["filename"]],
+                }
+                if "label" in sample:
+                    batch["label"] = sample["label"].unsqueeze(0)
+                return batch
+
+            return DataLoader(
+                _DummyDataset(),
+                batch_size=1,
+                collate_fn=_collate_single,
+            )
 
     return _DummyDataModule()
 
@@ -431,8 +466,10 @@ def _try_cache_only_intermediate_eval(
 
     test_cfg = getattr(getattr(cfg, "data", None), "test", None)
     label_value = getattr(test_cfg, "label", None)
-    nerl_only = label_value is None and _evaluation_metric_requested(cfg, "nerl")
-    if label_value is None and not nerl_only:
+    gt_free_only = label_value is None and any(
+        _evaluation_metric_requested(cfg, metric_name) for metric_name in ("nerl", "tube")
+    )
+    if label_value is None and not gt_free_only:
         return False
 
     label_paths: list[str] | None = None

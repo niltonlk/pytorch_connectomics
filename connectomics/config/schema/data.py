@@ -133,6 +133,7 @@ class ImageTransformConfig:
     clip_percentile_high: float = (
         1.0  # Upper percentile for clipping (1.0 = no clip, 0.95 = 95th percentile)
     )
+    channelwise: bool = False  # Normalize each CZYX input channel independently.
 
 
 @dataclass
@@ -175,6 +176,17 @@ class DataloaderConfig:
     # side per axis (legacy; equivalent to ``[0, 0, 0, a, b, c]``). Length 6
     # ``[pre0, pre1, pre2, post0, post1, post2]`` is the canonical asymmetric
     # form.
+    read_downscale: Any = 1.0
+    # Train/val read-size shrink factor in (0, 1]. The dataset reads a
+    # ``round(effective_patch_size * read_downscale)`` native crop and then a
+    # ``data.data_transform.resize`` step upsamples it back to the effective
+    # patch size, so erosion/affinity/model sizing are unchanged while the
+    # per-sample disk read changes by the product of per-axis factors (e.g.
+    # ``[1, 2, 2]`` reads a 2x wider XY crop before downsampling it). A scalar
+    # applies to every axis. 1.0 (default) is a complete no-op. When any
+    # factor differs from 1.0,
+    # ``data.data_transform.resize`` MUST equal the effective patch size so the
+    # native crop is upsampled back exactly (a guard enforces this).
     pin_memory: bool = True
     use_preloaded_cache_train: bool = True  # Preload training volumes into memory
     use_preloaded_cache_val: bool = True  # Preload validation volumes into memory
@@ -231,6 +243,23 @@ class DataInputConfig:
 
     # Voxel resolution (physical dimensions in nm)
     resolution: Optional[List[float]] = None  # Data resolution [z, y, x] in nm
+
+    # Sub-volume kept from every volume in this split, as
+    # ``[z0, z1, y0, y1, x0, x1]`` half-open voxel bounds, applied identically
+    # to image/label/label_aux/mask straight after read and before any other
+    # transform. ``None`` (default) keeps the whole volume.
+    #
+    # For datasets whose annotation covers only part of the stored volume:
+    # uniform patches over the full volume spend most of their loss mask on the
+    # ignore sentinel, so cropping to the annotated region plus a context halo
+    # raises the supervised fraction of every patch without rewriting the
+    # volumes on disk. Every axis of the crop must be at least the read patch
+    # size (``patch_size + target_context``) or the dataset would silently pad;
+    # ``runtime.preflight`` enforces that.
+    #
+    # Only the preloaded-cache path honours this. The lazy zarr/h5 datasets
+    # raise rather than ignore it.
+    crop: Optional[List[int]] = None
 
     # Skeleton ground-truth for NERL evaluation. str path (.pkl skeleton or
     # .npz ERLGraph), per-volume dict {volume_name: path}, or None.
@@ -318,6 +347,16 @@ class IntensityConfig:
     shift_intensity_offset: float = 0.1
     contrast_prob: float = 0.5
     contrast_range: Tuple[float, float] = (0.9, 1.1)
+
+
+@dataclass
+class ViewDropoutConfig:
+    """Drop exactly one input view for robustness to degraded acquisitions."""
+
+    enabled: bool = False
+    prob: float = 0.0
+    channels: List[int] = field(default_factory=lambda: [0, 1])
+    fill_value: float = 0.0
 
 
 @dataclass
@@ -501,6 +540,7 @@ class AugmentationConfig:
     rotate: RotateConfig = field(default_factory=RotateConfig)
     elastic: ElasticConfig = field(default_factory=ElasticConfig)
     intensity: IntensityConfig = field(default_factory=IntensityConfig)
+    view_dropout: ViewDropoutConfig = field(default_factory=ViewDropoutConfig)
 
     # Artifact simulation augmentations
     slice_shift: SliceShiftConfig = field(default_factory=SliceShiftConfig)

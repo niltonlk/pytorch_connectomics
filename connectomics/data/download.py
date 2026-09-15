@@ -11,49 +11,65 @@ import sys
 import tarfile
 import zipfile
 from pathlib import Path
+from typing import Any
 from urllib.error import URLError
 from urllib.request import urlretrieve
 
 # Dataset registry with download information
-DATASETS = {
+DATASETS: dict[str, dict[str, Any]] = {
     "lucchi": {
         "name": "Lucchi++ Mitochondria Segmentation",
-        "url": "https://huggingface.co/datasets/pytc/tutorial/resolve/main/lucchi%2B%2B.zip",
+        "url": (
+            "https://huggingface.co/pytc/tutorial/resolve/main/"
+            "mito_lucchi%2B%2B/lucchi%2B%2B.zip"
+        ),
         "filename": "lucchi++.zip",
-        "archive_dir": "lucchi++",
         "extract_dir": "lucchi++",
+        "extract_to_dataset_dir": True,
         "description": "EM images with mitochondria annotations from Lucchi et al.",
-        "size": "~50 MB",
+        "size": "~211 MiB",
         "files": [
-            "datasets/lucchi++/train_image.h5",
-            "datasets/lucchi++/train_label.h5",
-            "datasets/lucchi++/test_image.h5",
-            "datasets/lucchi++/test_label.h5",
+            "datasets/lucchi++/train_im.h5",
+            "datasets/lucchi++/train_mito.h5",
+            "datasets/lucchi++/test_im.h5",
+            "datasets/lucchi++/test_mito.h5",
         ],
     },
     "lucchi++": {  # Alias for lucchi
         "name": "Lucchi++ Mitochondria Segmentation",
-        "url": "https://huggingface.co/datasets/pytc/tutorial/resolve/main/lucchi%2B%2B.zip",
+        "url": (
+            "https://huggingface.co/pytc/tutorial/resolve/main/"
+            "mito_lucchi%2B%2B/lucchi%2B%2B.zip"
+        ),
         "filename": "lucchi++.zip",
-        "archive_dir": "lucchi++",
         "extract_dir": "lucchi++",
+        "extract_to_dataset_dir": True,
         "description": "EM images with mitochondria annotations from Lucchi et al.",
-        "size": "~50 MB",
+        "size": "~211 MiB",
         "files": [
-            "datasets/lucchi++/train_image.h5",
-            "datasets/lucchi++/train_label.h5",
-            "datasets/lucchi++/test_image.h5",
-            "datasets/lucchi++/test_label.h5",
+            "datasets/lucchi++/train_im.h5",
+            "datasets/lucchi++/train_mito.h5",
+            "datasets/lucchi++/test_im.h5",
+            "datasets/lucchi++/test_mito.h5",
         ],
     },
     "snemi": {
         "name": "SNEMI3D Neuron Segmentation",
-        "url": "https://huggingface.co/datasets/pytc/tutorial/resolve/main/SNEMI3D.zip",
-        "filename": "SNEMI3D.zip",
-        "archive_dir": "SNEMI3D",
-        "extract_dir": "snemi",
+        # The three EM volumes come from Zenodo record 7142003, repacked flat
+        # (the Zenodo archive nests them under image/ and seg/) and joined by
+        # test-labels.h5, which the challenge withheld from that release.
+        "url": "https://huggingface.co/pytc/tutorial/resolve/main/neuron_snemi/snemi.zip",
+        "filename": "snemi.zip",
+        "extract_dir": "SNEMI",
+        "extract_to_dataset_dir": True,
         "description": "SNEMI3D neuron segmentation challenge dataset",
-        "size": "~200 MB",
+        "size": "~190 MiB",
+        "files": [
+            "datasets/SNEMI/train-input.tif",
+            "datasets/SNEMI/train-labels.tif",
+            "datasets/SNEMI/test-input.tif",
+            "datasets/SNEMI/test-labels.h5",
+        ],
     },
     "mitoem": {
         "name": "MitoEM Mitochondria Segmentation",
@@ -138,14 +154,17 @@ def download_dataset(
         return False
 
     # Extract
-    print(f"Extracting to {output_dir}...")
+    extract_root = extract_path if dataset_info.get("extract_to_dataset_dir") else output_dir
+    extract_root.mkdir(parents=True, exist_ok=True)
+
+    print(f"Extracting to {extract_root}...")
     try:
         if zip_path.suffix == ".zip":
             with zipfile.ZipFile(zip_path, "r") as zf:
-                zf.extractall(output_dir)
+                zf.extractall(extract_root)
         elif zip_path.suffix in [".tar", ".gz", ".tgz"]:
             with tarfile.open(zip_path, "r:*") as tf:
-                tf.extractall(output_dir)
+                tf.extractall(extract_root)
         else:
             print(f"ERROR: Unknown archive format: {zip_path.suffix}")
             return False
@@ -155,7 +174,11 @@ def download_dataset(
 
     # Rename archive directory to canonical name if needed
     archive_dir = dataset_info.get("archive_dir")
-    if archive_dir and archive_dir != dataset_info["extract_dir"]:
+    if (
+        archive_dir
+        and archive_dir != dataset_info["extract_dir"]
+        and not dataset_info.get("extract_to_dataset_dir")
+    ):
         archive_path = output_dir / archive_dir
         if archive_path.exists():
             if extract_path.exists():

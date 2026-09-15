@@ -23,7 +23,9 @@ __all__ = [
     "resolve_affinity_mode_from_cfg",
     "resolve_affinity_offsets_from_kwargs",
     "resolve_affinity_offsets_for_channel_slice",
+    "resolve_stacked_label_channel_count",
     "seg_to_affinity",
+    "seg_to_thin_affinity_weight",
 ]
 
 
@@ -200,14 +202,14 @@ def resolve_affinity_mode_from_cfg(cfg: Any) -> Optional[str]:
     return unique_modes[0]
 
 
-def resolve_affinity_channel_groups_from_cfg(
+def _resolve_stacked_label_layout(
     cfg: Any,
-) -> list[tuple[tuple[int, int], list[tuple[int, int, int]]]]:
-    """Resolve stacked label channel ranges for configured affinity tasks."""
+) -> tuple[int, list[tuple[tuple[int, int], list[tuple[int, int, int]]]]]:
+    """Return the total stacked width and affinity channel groups."""
     data_cfg = getattr(cfg, "data", None)
     label_cfg = getattr(data_cfg, "label_transform", None) if data_cfg is not None else None
     if label_cfg is None:
-        return []
+        return 0, []
 
     targets = getattr(label_cfg, "targets", None)
     stack_outputs = bool(getattr(label_cfg, "stack_outputs", True))
@@ -221,11 +223,11 @@ def resolve_affinity_channel_groups_from_cfg(
 
     groups: list[tuple[tuple[int, int], list[tuple[int, int, int]]]] = []
     if targets is None or not stack_outputs:
-        return groups
+        return 0, groups
 
     task_entries = _task_entries(targets)
     if not task_entries:
-        return groups
+        return 0, groups
 
     channel_start = 0
     for task in task_entries:
@@ -237,7 +239,21 @@ def resolve_affinity_channel_groups_from_cfg(
             groups.append(((channel_start, channel_start + num_channels), parsed_offsets))
         channel_start += num_channels
 
+    return channel_start, groups
+
+
+def resolve_affinity_channel_groups_from_cfg(
+    cfg: Any,
+) -> list[tuple[tuple[int, int], list[tuple[int, int, int]]]]:
+    """Resolve stacked label channel ranges for configured affinity tasks."""
+    _total_channels, groups = _resolve_stacked_label_layout(cfg)
     return groups
+
+
+def resolve_stacked_label_channel_count(cfg: Any) -> int:
+    """Return the total number of channels in the configured stacked label tensor."""
+    total_channels, _groups = _resolve_stacked_label_layout(cfg)
+    return total_channels
 
 
 def resolve_affinity_offsets_for_channel_slice(
@@ -410,6 +426,7 @@ def seg_to_affinity(
     offsets: Optional[List[str]] = None,
     long_range: Optional[int] = None,
     affinity_mode: str = "deepem",
+    semantic: bool = False,
 ) -> "AffinityTarget":
     """
     Compute affinity maps from segmentation.
@@ -438,6 +455,21 @@ def seg_to_affinity(
                     - Channels 3-5: long-range (offset ``long_range``) along
                       axes 0, 1, 2
         affinity_mode: ``deepem`` or ``banis``.
+        semantic: Treat ``seg`` as a semantic foreground mask rather than an
+                  instance map — every positive value is collapsed to one ID
+                  (``-1`` still means unlabeled). For unit offsets this is
+                  exactly the instance affinity, because two 6-adjacent
+                  foreground voxels are always the same object.
+
+                  **A semantic mask can never yield LONG-RANGE affinity.** At
+                  offset > 1 the target asks "are these two voxels the same
+                  object", and a mask cannot answer it — two foreground voxels
+                  10 apart routinely belong to different cells, so every
+                  cross-cell pair would be labelled connected. There is no
+                  approximation available and no flag to loosen this; if you
+                  need the 6-channel banis+ target, you need real instance
+                  labels. Non-unit offsets therefore raise rather than emit a
+                  silently wrong target.
 
     Returns:
         :class:`AffinityTarget` carrying ``values`` (bool) and ``mask`` (bool),
@@ -450,6 +482,17 @@ def seg_to_affinity(
     parsed_offsets = resolve_affinity_offsets_from_kwargs(
         {"offsets": offsets, "long_range": long_range}
     )
+    if semantic:
+        non_unit = [o for o in parsed_offsets if sum(abs(v) for v in o) > 1]
+        if non_unit:
+            raise ValueError(
+                "semantic=True supports unit offsets only; got "
+                f"{['-'.join(map(str, o)) for o in non_unit]}. Long-range affinity "
+                "cannot be recovered from a semantic mask — two foreground voxels "
+                "that far apart may be different objects."
+            )
+        seg = np.where(seg > 0, 1, seg)  # collapse IDs, keep 0 background and -1 ignore
+
     num_channels = len(parsed_offsets)
     values = np.zeros((num_channels, *seg.shape), dtype=bool)
     mask = np.zeros_like(values, dtype=bool)
@@ -467,3 +510,97 @@ def seg_to_affinity(
         mask[i][storage_slice] = labeled_mask[src_slice] & labeled_mask[dst_slice]
 
     return AffinityTarget(values=values, mask=mask, affinity_mode=mode)
+
+
+def seg_to_thin_affinity_weight(
+    seg: np.ndarray,
+    offsets: Optional[List[str]] = None,
+    long_range: Optional[int] = None,
+    affinity_mode: str = "banis",
+    resolution: Sequence[float] = (1.0, 1.0, 1.0),
+    radius_ref: float = 8.0,
+    max_weight: float = 4.0,
+    include_negative: bool = False,
+) -> np.ndarray:
+    """Per-edge affinity loss weight that upweights TRUE edges on thin processes.
+
+    Motivation (measured on LICONN seed6, ``dev/nisb/liconn/affinity_separability.py``):
+    the predicted affinity on genuine same-instance edges falls with the local
+    caliber of the process -- median 0.52 below 27 nm, then 0.62, 0.67, 0.74 above
+    72 nm -- while the affinity on cross-instance edges is flat at 0.36 (p95 0.51)
+    at *every* caliber. The decoder applies one global threshold, so the threshold
+    that is safe against cross-instance edges (0.70) sits above the same-instance
+    median of every caliber band below 72 nm, and a quarter of the GT skeleton
+    falls out of the segmentation even though the model put 0.63 affinity on it.
+
+    Class-balanced BCE has no reason to fix this: thin edges are a minority of
+    voxels but carry most of the *skeleton length* that ERL scores, so the model
+    is free to hedge on them. This target restores the balance by weighting each
+    same-instance edge by how thin its process is::
+
+        w = 1 + (max_weight - 1) * clip((radius_ref - r) / radius_ref, 0, 1)
+
+    with ``r`` the boundary EDT at the edge's storage voxel. Cross-instance edges
+    keep weight 1 (unless ``include_negative``), so the pressure is one-sided: it
+    raises confidence on true thin continuations without teaching the model to
+    connect across a membrane.
+
+    Feed the result to ``PerChannelBCEWithLogitsLoss`` through the loss term's
+    ``mask_slice``; the orchestrator multiplies it into the affinity valid mask.
+
+    Args:
+        seg: Instance segmentation, ``0`` background, ``-1`` unlabeled. Spatial
+            shape ``(A0, A1, A2)``; as in :func:`seg_to_affinity` the axis meaning
+            follows the caller's convention (BANIS-layout NISB volumes are
+            ``(X, Y, Z)``).
+        offsets: Affinity offsets; must match the affinity target this weight is
+            paired with so channel ``c`` weights the same edge.
+        long_range: Long-range shorthand, as in :func:`seg_to_affinity`.
+        affinity_mode: ``deepem`` or ``banis``; must match the paired affinity.
+        resolution: Physical voxel size along axes 0, 1, 2, in the same unit as
+            ``radius_ref``. Defaults to voxel units.
+        radius_ref: Caliber at and above which the weight is 1.
+        max_weight: Weight at zero caliber.
+        include_negative: Also weight cross-instance edges by caliber. Off by
+            default -- the measured deficit is one-sided.
+
+    Returns:
+        ``float32`` array of shape ``(num_channels, A0, A1, A2)`` with values in
+        ``[1, max_weight]``.
+    """
+    from scipy import ndimage as ndi
+
+    if max_weight < 1.0:
+        raise ValueError(f"max_weight must be >= 1, got {max_weight}.")
+    if radius_ref <= 0:
+        raise ValueError(f"radius_ref must be > 0, got {radius_ref}.")
+
+    mode = normalize_affinity_mode(affinity_mode)
+    parsed_offsets = resolve_affinity_offsets_from_kwargs(
+        {"offsets": offsets, "long_range": long_range}
+    )
+    sampling = tuple(float(value) for value in resolution)
+    if len(sampling) != seg.ndim:
+        raise ValueError(
+            f"resolution length {len(sampling)} != seg ndim {seg.ndim}; resolution "
+            "must give one spacing per spatial axis."
+        )
+
+    radius = ndi.distance_transform_edt(seg > 0, sampling=sampling).astype(np.float32)
+    thin = np.clip((float(radius_ref) - radius) / float(radius_ref), 0.0, 1.0)
+    voxel_weight = 1.0 + (float(max_weight) - 1.0) * thin
+
+    weights = np.ones((len(parsed_offsets), *seg.shape), dtype=np.float32)
+    for i, offset in enumerate(parsed_offsets):
+        if all(value == 0 for value in offset):
+            weights[i] = voxel_weight if include_negative else np.where(seg > 0, voxel_weight, 1.0)
+            continue
+
+        src_slice, dst_slice = _source_destination_slices(offset)
+        storage_slice = dst_slice if mode == "deepem" else src_slice
+        w = voxel_weight[storage_slice]
+        if not include_negative:
+            same = (seg[src_slice] == seg[dst_slice]) & (seg[storage_slice] > 0)
+            w = np.where(same, w, 1.0)
+        weights[i][storage_slice] = w
+    return weights

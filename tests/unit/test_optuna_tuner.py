@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from omegaconf import OmegaConf
 
 from connectomics.config import Config
 from connectomics.config.schema.stages import TuneConfig
@@ -14,6 +15,7 @@ from connectomics.decoding.tuning.optuna_tuner import (
     _evaluate_batch_trial_payload,
     _evaluate_standard_trial_payload,
     _get_trial_process_context,
+    _run_trial_payload_with_timeout,
 )
 from connectomics.runtime.tune_runner import load_and_apply_best_params, run_tuning
 
@@ -130,6 +132,40 @@ def test_run_tuning_uses_intermediate_only_inference_overrides(monkeypatch, tmp_
     assert captured["mask"] is None
 
 
+def test_run_tuning_nonzero_rank_waits_for_rank_zero_after_inference(monkeypatch, tmp_path):
+    cfg = Config()
+    cfg.tune = TuneConfig()
+    cfg.inference.save_path = str(tmp_path / "results")
+    cfg.tune.save_predictions_path = str(tmp_path / "tuning" / "predictions")
+    cfg.data.val.image = str(tmp_path / "images" / "volume_input.h5")
+    cfg.data.val.label = str(tmp_path / "labels" / "volume_label.h5")
+
+    image_file = Path(cfg.data.val.image)
+    image_file.parent.mkdir(parents=True, exist_ok=True)
+    image_file.touch()
+
+    trainer = _DummyTrainer()
+    barrier_calls = []
+    monkeypatch.setattr("connectomics.runtime.tune_runner.OPTUNA_AVAILABLE", True)
+    monkeypatch.setattr(
+        "connectomics.training.lightning.create_datamodule",
+        lambda cfg, mode="tune": {"cfg": cfg, "mode": mode},
+    )
+    monkeypatch.setattr(
+        "connectomics.runtime.tune_runner._distributed_barrier_rank",
+        lambda: barrier_calls.append(True) or 1,
+    )
+    monkeypatch.setattr(
+        "connectomics.runtime.tune_runner.OptunaDecodingTuner",
+        lambda *args, **kwargs: pytest.fail("nonzero rank must not run Optuna"),
+    )
+
+    run_tuning(_DummyModel(cfg), trainer, cfg, checkpoint_path="checkpoint.ckpt")
+
+    assert trainer.observed["datamodule"]["mode"] == "tune"
+    assert len(barrier_calls) == 2
+
+
 def test_run_tuning_ignores_stale_test_prediction_cache_when_tuning(monkeypatch, tmp_path):
     cfg = Config()
     cfg.tune = TuneConfig()
@@ -236,6 +272,48 @@ def test_run_tuning_uses_result_prediction_cache_when_tuning_folder_missing(monk
     assert len(captured["predictions"]) == 1
     assert np.array_equal(captured["predictions"][0], expected_prediction)
     assert len(captured["ground_truth"]) == 1
+
+
+def test_run_tuning_crops_model_minimum_size_padding_to_label_shape(monkeypatch, tmp_path):
+    cfg = Config()
+    cfg.tune = TuneConfig()
+    cfg.inference.save_path = str(tmp_path / "results")
+    cfg.tune.save_predictions_path = str(tmp_path / "tuning" / "predictions")
+    cfg.data.dataloader.patch_size = [4, 2, 2]
+    cfg.data.val.image = str(tmp_path / "images" / "train-input.h5")
+    cfg.data.val.label = str(tmp_path / "labels" / "train-labels.h5")
+
+    image_file = Path(cfg.data.val.image)
+    image_file.parent.mkdir(parents=True, exist_ok=True)
+    image_file.touch()
+    prediction_file = tmp_path / "results" / "train-input" / "raw_x1.h5"
+    prediction_file.parent.mkdir(parents=True, exist_ok=True)
+    prediction_file.touch()
+    label_file = Path(cfg.data.val.label)
+    label_file.parent.mkdir(parents=True, exist_ok=True)
+    label_file.touch()
+
+    loaded_arrays = {
+        str(prediction_file): np.arange(3 * 4 * 3 * 3, dtype=np.float32).reshape(3, 4, 3, 3),
+        str(label_file): np.zeros((2, 3, 3), dtype=np.uint16),
+    }
+    captured = {}
+
+    class _FakeTuner:
+        def __init__(self, cfg, predictions, ground_truth, mask=None):
+            captured["predictions"] = predictions
+
+        def optimize(self):
+            return _FakeStudy()
+
+    monkeypatch.setattr("connectomics.runtime.tune_runner.OPTUNA_AVAILABLE", True)
+    monkeypatch.setattr("connectomics.data.io.read_volume", lambda path: loaded_arrays[str(path)])
+    monkeypatch.setattr("connectomics.runtime.tune_runner.OptunaDecodingTuner", _FakeTuner)
+
+    run_tuning(None, lambda: pytest.fail("cache should skip inference"), cfg)
+
+    expected = loaded_arrays[str(prediction_file)][:, 1:3]
+    assert np.array_equal(captured["predictions"][0], expected)
 
 
 def test_run_tuning_uses_checkpoint_test_prediction_cache(monkeypatch, tmp_path):
@@ -519,7 +597,10 @@ def test_load_and_apply_best_params_falls_back_to_legacy_filename(tmp_path):
 def test_standard_trial_payload_applies_spatial_transpose():
     captured = {}
 
-    def _fake_decoder(predictions, **_kwargs):
+    # Registry decoders follow the graph-op contract: they receive a *list* of
+    # input arrays (see connectomics/decoding/graph.py: ``op(op_inputs, ...)``).
+    def _fake_decoder(inputs, **_kwargs):
+        predictions = inputs[0]
         captured["shape"] = predictions.shape
         return np.ones(predictions.shape[1:], dtype=np.uint64)
 
@@ -540,7 +621,8 @@ def test_standard_trial_payload_applies_spatial_transpose():
 def test_batch_trial_payload_applies_spatial_transpose():
     captured = {}
 
-    def _fake_decoder(predictions, **_kwargs):
+    def _fake_decoder(inputs, **_kwargs):
+        predictions = inputs[0]
         captured["shape"] = predictions.shape
         return {0.3: np.ones(predictions.shape[1:], dtype=np.uint64)}
 
@@ -559,6 +641,56 @@ def test_batch_trial_payload_applies_spatial_transpose():
     assert captured["shape"] == (3, 4, 3, 2)
     assert result["best_metric"] == 0.0
     assert result["best_candidate"] == 0.3
+
+
+def test_standard_trial_payload_decodes_multichannel_affinity_via_registry():
+    """Regression: a real registry decoder must receive the (C, *spatial) array
+    as one graph input, not have its channel axis read as the input count.
+
+    Before the fix the tuner called ``decoder_fn(predictions, ...)`` with the
+    bare array, so the graph-op wrapper saw ``len(inputs) == C`` and raised
+    ``Unary decoder 'decode_affinity_cc' expects exactly one input, got 3``.
+    """
+    from connectomics.decoding.registry import get_decoder
+
+    rng = np.random.default_rng(0)
+    pred = rng.random((3, 6, 6, 6), dtype=np.float32).astype(np.float16)
+
+    result = _evaluate_standard_trial_payload(
+        decoder_fn=get_decoder("decode_affinity_cc"),
+        predictions_list=[pred],
+        ground_truth_list=[np.ones((6, 6, 6), dtype=np.uint16)],
+        mask_list=None,
+        decoding_params={"threshold": 0.5, "backend": "numba", "edge_offset": 0},
+        postproc_params=None,
+        metric_name="adapted_rand",
+    )
+
+    assert np.isfinite(result["avg_metric"])
+
+
+def test_spawned_trial_payload_resolves_decoder_by_registry_name(monkeypatch):
+    import multiprocessing as mp
+
+    rng = np.random.default_rng(1)
+    payload = {
+        "decoder_fn_name": "decode_affinity_cc",
+        "predictions_list": [rng.random((3, 4, 4, 4), dtype=np.float32)],
+        "ground_truth_list": [np.ones((4, 4, 4), dtype=np.uint16)],
+        "mask_list": None,
+        "decoding_params": {"threshold": 0.5, "backend": "numba", "edge_offset": 0},
+        "postproc_params": None,
+        "metric_name": "adapted_rand",
+        "nerl_context": None,
+    }
+    monkeypatch.setattr(
+        "connectomics.decoding.tuning.optuna_tuner._get_trial_process_context",
+        lambda: mp.get_context("spawn"),
+    )
+
+    result = _run_trial_payload_with_timeout("standard", payload, timeout_sec=60)
+
+    assert np.isfinite(result["avg_metric"])
 
 
 def test_objective_returns_bad_value_when_standard_trial_times_out(monkeypatch):
@@ -628,6 +760,52 @@ def test_objective_returns_bad_value_when_waterz_batch_trial_times_out(monkeypat
     assert trial.user_attrs["trial_timeout"] == 30.0
 
 
+def test_save_results_persists_best_waterz_batch_threshold(tmp_path):
+    pytest.importorskip("optuna")
+    cfg = Config()
+    cfg.tune = TuneConfig()
+    cfg.tune.save_path = str(tmp_path)
+    cfg.tune.save_study = False
+    cfg.tune.parameter_space.decoding.function_name = "decode_waterz"
+    cfg.tune.parameter_space.decoding.defaults = {
+        "thresholds": 0.5,
+        "merge_function": "aff50_his256",
+        "aff_threshold": [0.1, 1.0],
+    }
+    cfg.tune.parameter_space.decoding.parameters = {
+        "thresholds": {
+            "type": "float",
+            "range": [0.1, 0.9],
+            "step": 0.1,
+        }
+    }
+
+    tuner = OptunaDecodingTuner(
+        cfg=cfg,
+        predictions=np.zeros((3, 4, 4, 4), dtype=np.float32),
+        ground_truth=np.zeros((4, 4, 4), dtype=np.uint16),
+    )
+
+    class _BestTrial:
+        number = 16
+        user_attrs = {
+            "best_threshold": 0.7,
+            "precision": 0.98,
+            "recall": 0.91,
+        }
+
+    class _Study:
+        best_trial = _BestTrial()
+        best_value = 0.05
+        best_params = {}
+
+    tuner._save_results(_Study())
+
+    best_params_file = next(tmp_path.glob("best_params*.yaml"))
+    saved = OmegaConf.load(best_params_file)
+    assert saved.decoding_params.thresholds == 0.7
+
+
 def test_get_trial_process_context_prefers_spawn_after_cuda_init(monkeypatch):
     observed = []
 
@@ -679,6 +857,10 @@ def test_get_trial_process_context_prefers_fork_without_cuda_init(monkeypatch):
         lambda: False,
     )
     monkeypatch.setattr(
+        "connectomics.decoding.tuning.optuna_tuner.is_mps_available",
+        lambda: False,
+    )
+    monkeypatch.setattr(
         "connectomics.decoding.tuning.optuna_tuner.mp.get_context", _fake_get_context
     )
 
@@ -686,3 +868,33 @@ def test_get_trial_process_context_prefers_fork_without_cuda_init(monkeypatch):
 
     assert isinstance(ctx, _DummyContext)
     assert observed == ["fork"]
+
+
+def test_get_trial_process_context_prefers_spawn_with_mps(monkeypatch):
+    observed = []
+
+    class _DummyContext:
+        pass
+
+    def _fake_get_context(method=None):
+        observed.append(method)
+        if method == "spawn":
+            return _DummyContext()
+        raise ValueError(f"unsupported: {method}")
+
+    monkeypatch.setattr(
+        "connectomics.decoding.tuning.optuna_tuner.torch.cuda.is_available",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        "connectomics.decoding.tuning.optuna_tuner.is_mps_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "connectomics.decoding.tuning.optuna_tuner.mp.get_context", _fake_get_context
+    )
+
+    ctx = _get_trial_process_context()
+
+    assert isinstance(ctx, _DummyContext)
+    assert observed == ["spawn"]

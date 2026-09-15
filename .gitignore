@@ -157,7 +157,10 @@ lib/
 
 # Development logs and documentation
 dev/
+notebooks/
+.ccc/
 .codex
 .claude
 .agent/
 slurm_jobs/
+.gcp-run/

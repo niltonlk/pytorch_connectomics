@@ -1,17 +1,11 @@
+# BANIS+ on the NISB basedata: shared +ML-ops recipe + NISB data, nothing else.
 _base_:
-  - base_banis_opt.yaml
+- ../banis+.yaml
+- dataset.yaml
 
-experiment_name: nisb_base_banis_v3_erosion2
+experiment_name: nisb_base_banis+
 description: >-
-  v3 training setup: v1 loss/EMA plus label erosion=2, using MedNeXt-L/k3
-  for higher-capacity affinity prediction.
+  BANIS+ training setup: per-channel class-balanced BCE, EMA, label erosion=2,
+  MedNeXt-L/k3, and a 200k-step schedule.
 
-save_path: outputs/nisb_base_banis_v3_erosion2
-
-default:
-  data:
-    dataloader:
-      batch_size: 2
-    label_transform:
-      erosion: 2
-
+save_path: outputs/nisb_base_banis+

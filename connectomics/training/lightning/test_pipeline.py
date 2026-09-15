@@ -14,6 +14,7 @@ import numpy as np
 import torch
 from pytorch_lightning.utilities.types import STEP_OUTPUT
 
+from ...config.hardware import empty_accelerator_cache
 from ...decoding import run_decoding_stage, write_decoded_outputs
 from ...decoding.qc import begin_streaming_qc, finish_streaming_qc
 from ...decoding.streamed_chunked import run_chunked_affinity_cc_inference
@@ -168,10 +169,10 @@ def _cleanup_inference_memory(module, stage: str, *, release_model: bool = False
     if cleanup_cfg is None or bool(getattr(cleanup_cfg, "gc_collect", True)):
         gc.collect()
 
-    if cleanup_cfg is None or bool(getattr(cleanup_cfg, "empty_cuda_cache", True)):
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            logger.info(f"Cleared CUDA cache after {stage}.")
+    if cleanup_cfg is None or bool(getattr(cleanup_cfg, "empty_accelerator_cache", True)):
+        cleared_backend = empty_accelerator_cache()
+        if cleared_backend is not None:
+            logger.info(f"Cleared {cleared_backend.upper()} cache after {stage}.")
 
 
 def _is_distributed_tta_sharding_active(module) -> bool:
@@ -373,12 +374,12 @@ def _evaluate_decoded_predictions(
 ) -> None:
     evaluation_context = _evaluation_context_from_module(module)
     evaluation_enabled = evaluation_context.is_enabled
-    nerl_requested = evaluation_enabled and evaluation_metric_requested(
-        evaluation_context,
-        "nerl",
+    gt_free_metric_requested = evaluation_enabled and any(
+        evaluation_metric_requested(evaluation_context, metric_name)
+        for metric_name in ("nerl", "tube")
     )
 
-    if evaluation_enabled and (labels is not None or nerl_requested):
+    if evaluation_enabled and (labels is not None or gt_free_metric_requested):
         logger.info("[STAGE: Computing Evaluation Metrics]")
         result = run_evaluation_stage(
             evaluation_context,
@@ -391,7 +392,7 @@ def _evaluate_decoded_predictions(
         return
 
     if labels is None:
-        logger.info("[STAGE: Evaluation] Skipped (no ground truth labels or NERL graph metric)")
+        logger.info("[STAGE: Evaluation] Skipped (no ground truth labels or GT-free metric)")
     else:
         logger.info("[STAGE: Evaluation] Skipped (evaluation disabled)")
 
@@ -882,9 +883,13 @@ def run_test_step(module, batch: Dict[str, torch.Tensor], batch_idx: int) -> STE
         logger.info(f"Input source:      {image_path}")
         logger.info(f"Input shape:       {reference_image_shape}")
         logger.info("Input device:      [lazy disk-backed volume]")
+        image_ndim = len(reference_image_shape)
     else:
+        if images is None:
+            raise RuntimeError("Non-lazy test samples require an image tensor.")
         logger.info(f"Input shape:       {tuple(images.shape)}")
         logger.info(f"Input device:      {images.device}")
+        image_ndim = images.ndim
     if crop_pad is not None:
         logger.info(f"Inference crop:    {list(crop_pad)}")
 
@@ -901,7 +906,6 @@ def run_test_step(module, batch: Dict[str, torch.Tensor], batch_idx: int) -> STE
         logger.info(f"Blending mode:      {blending}")
     else:
         logger.info("Sliding window:     [Direct inference, no sliding window]")
-    image_ndim = len(reference_image_shape) if lazy_sample else images.ndim
     logger.info(f"TTA:                {module._summarize_tta_plan(image_ndim)}")
     logger.info(f"{'=' * 70}")
 
@@ -911,7 +915,7 @@ def run_test_step(module, batch: Dict[str, torch.Tensor], batch_idx: int) -> STE
     if merge_heads:
         selected_output_head = "+".join(configured_heads)
         per_head_preds: list[np.ndarray] = []
-        reference_spatial_shape: tuple[int, ...] = ()
+        reference_spatial_shape = ()
         skip_local_distributed_shard = False
         for head_name in configured_heads:
             head_pred_np, reference_spatial_shape = _predict_output_head(

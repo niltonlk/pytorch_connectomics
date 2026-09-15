@@ -2,13 +2,13 @@ import argparse
 from pathlib import Path
 
 import numpy as np
-import torch
-
 from connectomics.config import Config, save_config
+from connectomics.config.hardware import get_accelerator_device_count
 from connectomics.config.schema.evaluation import EvaluationConfig
 from connectomics.config.schema.stages import TuneConfig
 from connectomics.data.io import write_hdf5
 from connectomics.runtime.cache_resolver import (
+    create_decode_only_datamodule,
     has_cached_predictions_in_output_dir,
 )
 from connectomics.runtime.cache_resolver import (
@@ -86,6 +86,24 @@ def test_is_test_evaluation_enabled_supports_mapping_or_dataclass_config():
 
     cfg.evaluation = {"enabled": True}
     assert _is_test_evaluation_enabled(cfg) is True
+
+
+def test_decode_only_datamodule_propagates_dense_test_label(tmp_path):
+    label = np.arange(24, dtype=np.uint32).reshape(2, 3, 4)
+    label_path = tmp_path / "label.h5"
+    write_hdf5(str(label_path), label, dataset="main")
+    cfg = Config()
+    cfg.data.test.label = str(label_path)
+
+    datamodule = create_decode_only_datamodule(
+        cfg,
+        str(tmp_path / "raw_affinity.h5"),
+    )
+    batch = next(iter(datamodule.test_dataloader()))
+
+    assert batch["filename"] == ["raw_affinity"]
+    assert tuple(batch["label"].shape) == (1, 2, 3, 4)
+    np.testing.assert_array_equal(batch["label"][0].numpy(), label)
 
     cfg.evaluation = EvaluationConfig(enabled=False)
     assert _is_test_evaluation_enabled(cfg) is False
@@ -202,7 +220,7 @@ def test_maybe_enable_independent_test_sharding_uses_rank_env_for_multi_volume_t
     assert changed is True
     assert args.shard_id == 2
     assert args.num_shards == 4
-    assert cfg.system.num_gpus == (1 if torch.cuda.is_available() else 0)
+    assert cfg.system.num_gpus == min(1, get_accelerator_device_count("auto"))
     assert cfg.inference.test_time_augmentation.distributed_sharding is False
 
 
@@ -216,7 +234,7 @@ def test_maybe_enable_independent_test_sharding_uses_explicit_shard_args(tmp_pat
     changed = maybe_enable_independent_test_sharding(args, cfg)
 
     assert changed is True
-    assert cfg.system.num_gpus == (1 if torch.cuda.is_available() else 0)
+    assert cfg.system.num_gpus == min(1, get_accelerator_device_count("auto"))
 
 
 def test_maybe_enable_independent_test_sharding_skips_single_volume_tests(tmp_path, monkeypatch):
@@ -268,7 +286,7 @@ def test_naive_chunk_sharding_claims_explicit_shard_args_without_volume_sharding
     assert changed is True
     assert cfg.inference.chunking.shard_id == 1
     assert cfg.inference.chunking.num_shards == 4
-    assert cfg.system.num_gpus == (1 if torch.cuda.is_available() else 0)
+    assert cfg.system.num_gpus == min(1, get_accelerator_device_count("auto"))
     assert maybe_enable_independent_test_sharding(args, cfg) is False
     assert has_assigned_test_shard(cfg, args) is True
 
@@ -324,6 +342,59 @@ def test_tune_cache_only_preserves_checkpoint_tag_for_tuning_suffix(tmp_path, mo
     assert captured["model"] is None
     assert captured["cfg"] is cfg
     assert captured["checkpoint_path"] == args.checkpoint
+
+
+def test_tune_test_cache_detection_checks_resolved_test_stage(tmp_path, monkeypatch):
+    cfg = Config()
+    cfg.tune = TuneConfig()
+    args = _make_args(tmp_path / "config.yaml", mode="tune-test")
+    test_stage_cfg = Config()
+    captured = {"cache_checks": []}
+
+    monkeypatch.setattr(
+        "connectomics.runtime.dispatch.setup_runtime_directories",
+        lambda _args, _cfg: (tmp_path / "tuning", tmp_path),
+    )
+    monkeypatch.setattr(
+        "connectomics.runtime.dispatch.try_cache_only_test_execution",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        "connectomics.runtime.dispatch.resolve_test_stage_runtime",
+        lambda _cfg: test_stage_cfg,
+    )
+    monkeypatch.setattr(
+        "connectomics.runtime.dispatch.has_tta_prediction_file",
+        lambda _cfg: False,
+    )
+
+    def _fake_cache_check(runtime_cfg, mode, **_kwargs):
+        captured["cache_checks"].append((runtime_cfg, mode))
+        return mode == "tune"
+
+    monkeypatch.setattr(
+        "connectomics.runtime.dispatch.has_cached_predictions_in_output_dir",
+        _fake_cache_check,
+    )
+
+    def _fake_model_build(*_args, **kwargs):
+        captured["tta_cached"] = kwargs["tta_cached"]
+        return object(), None
+
+    monkeypatch.setattr("connectomics.runtime.dispatch._create_runtime_model", _fake_model_build)
+    monkeypatch.setattr(
+        "connectomics.runtime.tune_runner.run_tuning",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "connectomics.runtime.dispatch._run_test",
+        lambda *_args, **_kwargs: None,
+    )
+
+    dispatch_runtime(args, cfg)
+
+    assert captured["cache_checks"] == [(cfg, "tune"), (test_stage_cfg, "test")]
+    assert captured["tta_cached"] is False
 
 
 def test_checkpoint_tune_uses_tuning_prediction_folder(tmp_path):

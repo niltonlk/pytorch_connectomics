@@ -115,6 +115,33 @@ class ChunkingConfig:
     chunk_size: Optional[List[int]] = None  # ZYX after test-time val_transpose.
     halo: List[int] = field(default_factory=lambda: [0, 0, 0])
     axes: str = "all"  # "all" or "z"; "z" keeps full YX in each chunk.
+    # Image geometry / ROI in INPUT voxel coords (ZYX) restricting the chunk grid.
+    # 3 ints = size [Z, Y, X] from origin 0; 6 ints = [z0, y0, x0, z1, y1, x1].
+    # When set, chunks whose core lies entirely outside the ROI (pure zero-padding
+    # in an over-sized/padded volume, e.g. a zarr rounded out to 12288^2) are
+    # skipped instead of inferred. None = infer the whole grid (previous behavior).
+    roi: Optional[List[int]] = None
+    # Write each chunk straight into a CloudVolume *precomputed* layer at the output path
+    # instead of per-chunk HDF5 + a stitch pass. Chunks are disjoint and storage-chunk
+    # aligned, so ranks can write the shared layer concurrently without locking. This is
+    # what downstream CloudVolume consumers (ABISS/Seuron) read, so it removes the
+    # separate "mirror the h5 chunks into precomputed" conversion step entirely.
+    precomputed: bool = False
+    # XYZ nm. Required when `precomputed` is set (a precomputed layer must declare it).
+    precomputed_resolution: Optional[List[int]] = None
+    # XYZ storage chunk of the output layer. Must divide the inference chunk_size on
+    # every axis, otherwise concurrent chunk writes would straddle a storage chunk.
+    precomputed_chunk_size: List[int] = field(default_factory=lambda: [128, 128, 64])
+    # Affinity convention written into the precomputed layer.
+    #   "none"  - write the model's channels as-is.
+    #   "abiss" - convert BANIS/source-stored affinity to what ABISS reads:
+    #             (1) edge shift v -> v-1 (dst[c, v] = src[c, v-1] along spatial axis c),
+    #                 applied BEFORE the halo is cropped so the low face pulls the true
+    #                 neighbour voxel; only a real volume boundary is zero-filled, and
+    #             (2) channel reversal [z, y, x] -> [x, y, z], since ABISS expects
+    #                 channel 0 = x-affinity while the model emits channel 0 = z.
+    # Only valid for 3-channel affinity output.
+    precomputed_affinity_convention: str = "none"
     shard_id: Optional[int] = None  # External naive chunk shard index; set by CLI.
     num_shards: Optional[int] = None  # External naive chunk shard count; set by CLI.
     temp_dir: str = ""
@@ -171,7 +198,7 @@ class InferenceMemoryCleanupConfig:
 
     enabled: bool = True
     gc_collect: bool = True
-    empty_cuda_cache: bool = True
+    empty_accelerator_cache: bool = True
     # Opt-in only: safe for one-volume test jobs, but it prevents additional
     # forward passes in the same test epoch unless Lightning moves the module
     # back to the accelerator.

@@ -20,8 +20,12 @@ from typing import Any, Iterable, List, Tuple
 
 import yaml
 
-from connectomics.config import load_config
-from connectomics.runtime.preflight import validate_runtime_coherence
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from connectomics.config import load_config  # noqa: E402
+from connectomics.runtime.preflight import validate_runtime_coherence  # noqa: E402
 
 LEGACY_PATTERNS: List[Tuple[Tuple[str, ...], str]] = [
     (("inference", "data"), "Use `test.data` instead of `inference.data`."),
@@ -73,7 +77,10 @@ for _root in (
     _root_path = ".".join(_root)
     LEGACY_PATTERNS.extend(
         [
-            (_root + ("save",), f"Use `{_root_path}.save_results` and `{_root_path}.save_intermediate`."),
+            (
+                _root + ("save",),
+                f"Use `{_root_path}.save_results` and `{_root_path}.save_intermediate`.",
+            ),
             (_root + ("output_path",), f"Use `{_root_path}.save_path`."),
             (_root + ("output_suffix",), f"Use `{_root_path}.save_suffix`."),
             (_root + ("input_prediction_path",), f"Use `{_root_path}.load_prediction_path`."),
@@ -89,11 +96,17 @@ for _root in (("tune",), ("default", "tune")):
             (_root + ("output", "output_pred"), f"Use `{_root_path}.save_predictions_path`."),
             (_root + ("output", "cache_suffix"), f"Use `{_root_path}.save_cache_suffix`."),
             (_root + ("output", "save_all_trials"), f"Use `{_root_path}.save_all_trials`."),
-            (_root + ("output", "save_best_segmentation"), f"Use `{_root_path}.save_best_segmentation`."),
+            (
+                _root + ("output", "save_best_segmentation"),
+                f"Use `{_root_path}.save_best_segmentation`.",
+            ),
             (_root + ("output", "save_study"), f"Use `{_root_path}.save_study`."),
             (_root + ("output", "visualizations"), f"Use `{_root_path}.save_visualizations`."),
             (_root + ("output", "report"), f"Use `{_root_path}.save_report`."),
-            (_root + ("output",), f"`{_root_path}.output` was hoisted; use `{_root_path}.save_*` siblings."),
+            (
+                _root + ("output",),
+                f"`{_root_path}.output` was hoisted; use `{_root_path}.save_*` siblings.",
+            ),
         ]
     )
 
@@ -101,14 +114,18 @@ for _root in (("tune",), ("default", "tune")):
 # not write per-volume artifacts. Validator emits an info warning but does not
 # fail. Implemented inline in the validator main loop.
 ADVISORY_PATTERNS: List[Tuple[Tuple[str, ...], str]] = [
-    (("data", "train", "name"),
-     "data.train.name has no effect; train mode writes no per-volume artifacts. "
-     "Set `data.val.name` or `data.test.name` instead."),
-    (("default", "data", "train", "name"),
-     "default.data.train.name has no effect; set under val/test instead."),
+    (
+        ("data", "train", "name"),
+        "data.train.name has no effect; train mode writes no per-volume artifacts. "
+        "Set `data.val.name` or `data.test.name` instead.",
+    ),
+    (
+        ("default", "data", "train", "name"),
+        "default.data.train.name has no effect; set under val/test instead.",
+    ),
 ]
 
-CUSTOM_WORKFLOW_ROOTS = {"large_decode", "abiss_large"}
+CUSTOM_WORKFLOW_ROOTS = {"large_decode", "abiss_chunk", "seuron_replay", "error_correction"}
 
 
 def _has_path(data: Any, path: Tuple[str, ...]) -> bool:

@@ -1,0 +1,85 @@
+experiment_name: mito_lucchi++
+description: Binary mitochondria segmentation on Lucchi++ EM dataset
+
+_base_:
+  - ../../connectomics/config/all_profiles.yaml
+
+save_path: outputs/mito_lucchi++
+
+default:
+  pipeline_profile: binary
+  system:
+    profile: all-gpu-cpu
+  model:
+    arch:
+      type: mednext
+    input_size: [112, 112, 112]
+    output_size: [112, 112, 112]
+    mednext:
+      size: S
+      kernel_size: 3
+      dim: 3d
+      checkpoint_style: outside_block
+    loss:
+      deep_supervision: false
+  data:
+    dataloader:
+      profile: cached
+      patch_size: [112, 112, 112]
+      batch_size: 4
+    augmentation:
+      profile: aug_strong
+  inference:
+    window:
+      window_size: [112, 112, 112]
+      overlap: 0.5
+      blending: bump
+      sw_batch_size: 8
+    test_time_augmentation:
+      enabled: true
+      flip_axes: all
+
+  evaluation:
+    enabled: true
+    metrics: [jaccard]
+
+train:
+  data:
+    train:
+      image: datasets/lucchi++/train_im.h5
+      label: datasets/lucchi++/train_mito.h5
+      resolution: [5, 5, 5]
+  optimization:
+    profile: warmup_cosine_lr
+    optimizer:
+      name: AdamW
+      lr: 1.0e-3
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1.0e-8
+    n_steps_per_epoch: 1000
+    max_epochs: 150
+    precision: "16-mixed"
+    gradient_clip_val: 1.0
+    num_sanity_val_steps: 0
+
+  monitor:
+    logging:
+      scalar:
+        loss_every_n_steps: 50
+      images:
+        log_every_n_epochs: 10
+        max_images: 8
+        num_slices: 2
+    checkpoint:
+      save_top_k: 3
+      monitor: train_loss_total_epoch
+      save_last: true
+      checkpoint_filename: "{epoch:03d}-{train_loss_total_epoch:.4f}"
+
+test:
+  data:
+    test:
+      image: datasets/lucchi++/test_im.h5
+      label: datasets/lucchi++/test_mito.h5
+      resolution: [5, 5, 5]

@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import time
+from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 from ..chunked.chunk_grid import ChunkRef, build_chunk_grid
@@ -51,6 +56,138 @@ def _chunk_file_path(chunks_dir: Path, chunk: ChunkRef) -> Path:
     return chunks_dir / f"chunk_{chunk.key}.h5"
 
 
+def _precomputed_marker_path(chunks_dir: Path, chunk: ChunkRef) -> Path:
+    """Resume marker for a chunk already written into the precomputed layer.
+
+    The layer itself has no per-chunk file to stat, so completion is tracked here to
+    keep the same "skip finished chunks on re-run" behaviour as the HDF5 path.
+    """
+    return chunks_dir / f"chunk_{chunk.key}.done"
+
+
+def _open_precomputed_layer(
+    layer_dir: Path,
+    *,
+    volume_size_xyz: Sequence[int],
+    num_channels: int,
+    data_type: str,
+    resolution_xyz: Sequence[int],
+    chunk_size_xyz: Sequence[int],
+) -> Any:
+    """Open the output precomputed layer, creating its ``info`` exactly once.
+
+    Several ranks reach this concurrently, so creation is guarded by an O_EXCL lock
+    file: the winner commits ``info`` and the losers wait for it to appear. Once
+    ``info`` exists every rank just opens the layer; the voxel writes themselves are
+    disjoint and storage-chunk aligned, so they need no coordination.
+    """
+    from cloudvolume import CloudVolume
+
+    layer_dir.mkdir(parents=True, exist_ok=True)
+    layer_uri = "file://" + str(layer_dir.resolve())
+    info_path = layer_dir / "info"
+
+    if not info_path.exists():
+        lock_path = layer_dir / ".info.lock"
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            fd = None
+        if fd is not None:
+            try:
+                info = CloudVolume.create_new_info(
+                    num_channels=int(num_channels),
+                    layer_type="image",
+                    data_type=str(data_type),
+                    encoding="raw",
+                    resolution=[int(v) for v in resolution_xyz],
+                    voxel_offset=[0, 0, 0],
+                    volume_size=[int(v) for v in volume_size_xyz],
+                    chunk_size=[int(v) for v in chunk_size_xyz],
+                )
+                cv = CloudVolume(layer_uri, info=info, fill_missing=True, compress=True)
+                cv.commit_info()
+                logger.info(
+                    "Created precomputed output layer %s (size_xyz=%s, channels=%d, "
+                    "dtype=%s, resolution_xyz=%s, chunk_xyz=%s)",
+                    layer_uri,
+                    list(volume_size_xyz),
+                    int(num_channels),
+                    data_type,
+                    list(resolution_xyz),
+                    list(chunk_size_xyz),
+                )
+            finally:
+                os.close(fd)
+        else:
+            for _ in range(600):  # ~60 s; the writer only has one small file to commit
+                if info_path.exists():
+                    break
+                time.sleep(0.1)
+            if not info_path.exists():
+                raise RuntimeError(f"Timed out waiting for precomputed info at {info_path}")
+
+    return CloudVolume(layer_uri, fill_missing=True, compress=True, progress=False)
+
+
+def _to_abiss_affinity_convention(pred: np.ndarray) -> np.ndarray:
+    """Convert BANIS/source-stored affinity to the convention ABISS reads.
+
+    Two independent changes, both required (see
+    ``dev/zebrafinch/upload_affinity_full_masked.py``, which applied them as a
+    post-hoc pass over saved HDF5 chunks):
+
+    1. Edge shift ``dst[c, v] = src[c, v-1]`` along spatial axis ``c``. The model
+       stores an edge on its *source* voxel (``v -> v+1``); ABISS expects it on the
+       *destination* (``v -> v-1``).
+    2. Channel reversal ``[z, y, x] -> [x, y, z]``: the model emits channel 0 =
+       z-affinity, ABISS expects channel 0 = x-affinity.
+
+    Call this on the HALOED prediction, before the core is cropped out: the shift
+    reads voxel ``v-1``, so the halo supplies the low face. Index 0 of the array is
+    zero-filled, which is correct only where the array edge is a true volume
+    boundary -- everywhere else that slice lies inside the halo and is cropped away.
+    Order matters: shift while channels still line up with spatial axes, then reverse.
+    """
+    if pred.shape[0] != 3:
+        raise ValueError(
+            "chunking.precomputed_affinity_convention='abiss' expects 3-channel "
+            f"affinity in (C, Z, Y, X) order, got shape {tuple(pred.shape)}."
+        )
+    shifted = np.zeros_like(pred)
+    for c in range(3):
+        dst = [slice(None)] * 4
+        src = [slice(None)] * 4
+        dst[0] = src[0] = c
+        dst[c + 1] = slice(1, None)
+        src[c + 1] = slice(0, -1)
+        shifted[tuple(dst)] = pred[tuple(src)]
+    return shifted[::-1]
+
+
+def _validate_precomputed_alignment(
+    chunk_shape_zyx: Sequence[int], chunk_size_xyz: Sequence[int]
+) -> None:
+    """Fail fast if inference chunks do not tile the layer's storage chunks.
+
+    Ranks write disjoint inference chunks concurrently. If an inference chunk does not
+    land on storage-chunk boundaries, two ranks can touch the same storage chunk and
+    race, so this is a correctness requirement rather than a tuning knob.
+    """
+    chunk_shape_xyz = [int(v) for v in reversed(list(chunk_shape_zyx))]
+    bad = [
+        f"{axis}: inference chunk {chunk_shape_xyz[i]} is not a multiple of "
+        f"storage chunk {int(chunk_size_xyz[i])}"
+        for i, axis in enumerate("xyz")
+        if int(chunk_size_xyz[i]) <= 0 or chunk_shape_xyz[i] % int(chunk_size_xyz[i]) != 0
+    ]
+    if bad:
+        raise ValueError(
+            "chunking.precomputed_chunk_size must divide the inference chunk on every "
+            "axis so concurrent chunk writes never straddle a storage chunk. " + "; ".join(bad)
+        )
+
+
 def _distributed_barrier() -> None:
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.distributed.barrier()
@@ -75,6 +212,64 @@ def _resolve_external_chunk_shard(cfg: Any) -> tuple[int, int] | None:
             f"inference.chunking.shard_id={shard_id} out of range for num_shards={num_shards}."
         )
     return shard_id, num_shards
+
+
+def _resolve_inference_roi(
+    cfg: Any,
+) -> tuple[tuple[int, int, int], tuple[int, int, int]] | None:
+    """ROI (image geometry) in INPUT voxel coords (ZYX) restricting the chunk grid.
+
+    Returns ``((z0, y0, x0), (z1, y1, x1))`` or ``None`` when unset. Accepts 3 ints
+    (size from origin 0) or 6 ints (explicit start/stop). Chunks that don't overlap
+    this box are pure padding in an over-sized volume and are skipped.
+    """
+    chunking_cfg = getattr(getattr(cfg, "inference", None), "chunking", None)
+    roi = getattr(chunking_cfg, "roi", None) if chunking_cfg is not None else None
+    if roi is None:
+        return None
+    vals = [int(v) for v in roi]
+    if len(vals) == 3:
+        start, stop = (0, 0, 0), (vals[0], vals[1], vals[2])
+    elif len(vals) == 6:
+        start, stop = (vals[0], vals[1], vals[2]), (vals[3], vals[4], vals[5])
+    else:
+        raise ValueError(
+            f"inference.chunking.roi must have 3 (size) or 6 (start/stop) ints ZYX, got {roi!r}."
+        )
+    if any(stop[axis] <= start[axis] for axis in range(3)):
+        raise ValueError(
+            f"inference.chunking.roi stop must exceed start on every axis, got {roi!r}."
+        )
+    return start, stop
+
+
+def _filter_chunks_to_roi(chunks, roi, crop_before):
+    """Restrict the chunk grid to ``roi`` (INPUT coords): drop, then crop.
+
+    Chunks entirely outside ``roi`` are dropped. Chunks that *straddle* an ROI
+    boundary are cropped to it, so a border chunk's written core never extends past
+    the real volume geometry into pure padding. Without the crop a straddling chunk
+    is emitted at the full nominal chunk size — 126 of the 726 zebrafinch chunks
+    straddle, writing 37e9 padding voxels (5.3% of the volume).
+
+    ``index``/``key`` come from the pre-crop global grid and are preserved, so chunk
+    filenames still match the full-grid naming.
+    """
+    roi_start, roi_stop = roi
+
+    kept = []
+    for ch in chunks:
+        cs = tuple(ch.start[axis] + crop_before[axis] for axis in range(3))
+        ce = tuple(ch.stop[axis] + crop_before[axis] for axis in range(3))
+        if not all(cs[axis] < roi_stop[axis] and ce[axis] > roi_start[axis] for axis in range(3)):
+            continue
+        start = tuple(max(cs[axis], roi_start[axis]) - crop_before[axis] for axis in range(3))
+        stop = tuple(min(ce[axis], roi_stop[axis]) - crop_before[axis] for axis in range(3))
+        kept.append(
+            ch if (start, stop) == (ch.start, ch.stop) else replace(ch, start=start, stop=stop)
+        )
+
+    return kept
 
 
 def is_external_chunk_sharding_enabled(cfg: Any) -> bool:
@@ -287,8 +482,36 @@ def _run_chunked_prediction_per_rank(
 
     transform_cfg = getattr(cfg.inference, "prediction_transform", None)
 
+    # Optional: stream chunks straight into a CloudVolume precomputed layer instead of
+    # per-chunk HDF5 + stitching, so ABISS/Seuron can read inference output directly.
+    chunking_cfg = cfg.inference.chunking
+    precomputed_out = bool(getattr(chunking_cfg, "precomputed", False))
+    precomputed_cv: Any = None
+    precomputed_dir = output_path.with_suffix("")
+    precomputed_convention = str(
+        getattr(chunking_cfg, "precomputed_affinity_convention", "none")
+    ).lower()
+    if precomputed_out:
+        if precomputed_convention not in ("none", "abiss"):
+            raise ValueError(
+                "inference.chunking.precomputed_affinity_convention must be "
+                f"'none' or 'abiss', got {precomputed_convention!r}."
+            )
+        pc_resolution = getattr(chunking_cfg, "precomputed_resolution", None)
+        if not pc_resolution:
+            raise ValueError(
+                "inference.chunking.precomputed requires "
+                "inference.chunking.precomputed_resolution (XYZ nm)."
+            )
+        pc_chunk_xyz = list(getattr(chunking_cfg, "precomputed_chunk_size", [128, 128, 64]))
+        _validate_precomputed_alignment(chunk_shape, pc_chunk_xyz)
+
     for local_pos, (chunk_idx, chunk) in enumerate(my_chunks, start=1):
-        chunk_path = _chunk_file_path(chunks_dir, chunk)
+        chunk_path = (
+            _precomputed_marker_path(chunks_dir, chunk)
+            if precomputed_out
+            else _chunk_file_path(chunks_dir, chunk)
+        )
         if chunk_path.exists():
             logger.info(
                 "[rank %d] chunk %d/%d %s: already exists, skipping",
@@ -339,6 +562,11 @@ def _run_chunked_prediction_per_rank(
         pred = pred_tensor.detach().cpu().numpy()[0]
         del pred_tensor
 
+        if precomputed_convention == "abiss":
+            # Must run on the haloed array: the edge shift reads voxel v-1, so the
+            # halo (not a zero fill) supplies each core face except at the volume edge.
+            pred = _to_abiss_affinity_convention(pred)
+
         local_core_slices = tuple(
             slice(
                 pred_core_start[axis] - read_start[axis],
@@ -351,6 +579,48 @@ def _run_chunked_prediction_per_rank(
         core_pred = apply_storage_dtype_transform(cfg, core_pred)
 
         channel_count = int(core_pred.shape[0])
+
+        if precomputed_out:
+            if precomputed_cv is None:
+                precomputed_cv = _open_precomputed_layer(
+                    precomputed_dir,
+                    volume_size_xyz=tuple(reversed(final_shape)),
+                    num_channels=channel_count,
+                    data_type=str(core_pred.dtype),
+                    resolution_xyz=pc_resolution,
+                    chunk_size_xyz=pc_chunk_xyz,
+                )
+            # (C, Z, Y, X) -> CloudVolume's (X, Y, Z, C)
+            z0, y0, x0 = (int(chunk.start[axis]) for axis in range(3))
+            block = np.transpose(core_pred, (3, 2, 1, 0))
+            x1, y1, z1 = (x0 + block.shape[0], y0 + block.shape[1], z0 + block.shape[2])
+            precomputed_cv[x0:x1, y0:y1, z0:z1, :] = block
+            chunk_path.write_text(
+                json.dumps(
+                    {
+                        "chunk_key": chunk.key,
+                        "chunk_start_zyx": list(chunk.start),
+                        "chunk_stop_zyx": list(chunk.stop),
+                        "written_xyz": [[x0, y0, z0], [x1, y1, z1]],
+                    }
+                )
+            )
+            logger.info(
+                "[rank %d] chunk %d/%d %s -> precomputed [%d:%d, %d:%d, %d:%d]",
+                rank,
+                chunk_idx,
+                len(chunks),
+                chunk.key,
+                x0,
+                x1,
+                y0,
+                y1,
+                z0,
+                z1,
+            )
+            del pred, core_pred, block
+            continue
+
         chunk_h5_spatial_chunks = tuple(
             max(1, min(int(h5_spatial_chunks[axis]), int(core_shape[axis]))) for axis in range(3)
         )
@@ -395,6 +665,17 @@ def _run_chunked_prediction_per_rank(
 
     if use_distributed_barrier:
         _distributed_barrier()
+
+    if precomputed_out:
+        # The layer *is* the output: every chunk wrote its own disjoint region, so there
+        # is nothing to stitch and no whole-volume artifact to assemble.
+        if rank == 0:
+            logger.info(
+                "Chunked raw prediction wrote %d chunks into precomputed layer %s",
+                len(chunks),
+                precomputed_dir,
+            )
+        return precomputed_dir
 
     if rank == 0:
         index_path = _write_chunk_index(
@@ -473,6 +754,21 @@ def run_chunked_prediction_inference(
     chunk_shape = resolve_chunk_shape(cfg, final_shape)
     halo = tuple(int(v) for v in getattr(chunking_cfg, "halo", [0, 0, 0]))
     chunks = build_chunk_grid(final_shape, chunk_shape)
+    roi = _resolve_inference_roi(cfg)
+    if roi is not None:
+        n_all = len(chunks)
+        chunks = _filter_chunks_to_roi(chunks, roi, crop_before)
+        if not chunks:
+            raise ValueError(
+                f"inference.chunking.roi={roi} excludes every chunk (final_shape={final_shape})."
+            )
+        logger.info(
+            "Inference ROI %s (input ZYX voxels): kept %d/%d chunks, skipped %d pure-padding.",
+            roi,
+            len(chunks),
+            n_all,
+            n_all - len(chunks),
+        )
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     compression = getattr(cfg.inference, "save_compression", "gzip")

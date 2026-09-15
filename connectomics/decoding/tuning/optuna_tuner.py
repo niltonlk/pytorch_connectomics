@@ -37,6 +37,7 @@ try:
 except ImportError:
     OPTUNA_AVAILABLE = False
 
+from connectomics.config.hardware import is_mps_available
 from connectomics.metrics.metrics_seg import adapted_rand
 from connectomics.runtime.output_naming import (
     tuning_best_params_filename,
@@ -236,13 +237,18 @@ def _decode_with_pipeline_spatial_transpose(
     """Run a decoder while honoring the pipeline-level spatial_transpose kwarg."""
     params = dict(decoding_params)
     spatial_transpose = params.pop("spatial_transpose", None)
+    # ``decoder_fn`` comes from ``get_decoder`` and follows the graph-op call
+    # contract: it takes a *list* of input arrays (a unary decoder asserts
+    # ``len(inputs) == 1`` then calls ``fn(inputs[0])``). Passing the bare
+    # (C, *spatial) array makes the wrapper read the channel dim as the input
+    # count and reject multi-channel affinity. Wrap it like ``run_decode_graph``.
     if spatial_transpose is None:
-        return decoder_fn(predictions, **params)
+        return decoder_fn([predictions], **params)
 
     from ..pipeline import _apply_spatial_transpose, _invert_axis_permutation
 
     transposed = _apply_spatial_transpose(predictions, spatial_transpose)
-    result = decoder_fn(transposed, **params)
+    result = decoder_fn([transposed], **params)
     inverse = _invert_axis_permutation(spatial_transpose)
     if isinstance(result, dict):
         return {
@@ -254,7 +260,8 @@ def _decode_with_pipeline_spatial_transpose(
 
 def _evaluate_standard_trial_payload(
     *,
-    decoder_fn,
+    decoder_fn=None,
+    decoder_fn_name: str | None = None,
     predictions_list: list[np.ndarray],
     ground_truth_list: list[np.ndarray] | None,
     mask_list: list[np.ndarray] | None,
@@ -264,6 +271,10 @@ def _evaluate_standard_trial_payload(
     nerl_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run one standard decoding trial and return aggregate metrics."""
+    if decoder_fn is None:
+        if not decoder_fn_name:
+            raise ValueError("Trial payload requires decoder_fn or decoder_fn_name")
+        decoder_fn = get_decoder(decoder_fn_name)
     metric_values: list[float] = []
     precision_values: list[float] = []
     recall_values: list[float] = []
@@ -327,7 +338,8 @@ def _evaluate_standard_trial_payload(
 
 def _evaluate_batch_trial_payload(
     *,
-    decoder_fn,
+    decoder_fn=None,
+    decoder_fn_name: str | None = None,
     predictions_list: list[np.ndarray],
     ground_truth_list: list[np.ndarray] | None,
     mask_list: list[np.ndarray] | None,
@@ -339,6 +351,10 @@ def _evaluate_batch_trial_payload(
     nerl_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run one batch-decoder trial and return aggregate metrics."""
+    if decoder_fn is None:
+        if not decoder_fn_name:
+            raise ValueError("Trial payload requires decoder_fn or decoder_fn_name")
+        decoder_fn = get_decoder(decoder_fn_name)
     candidate_are: Dict[float, List[float]] = {val: [] for val in candidate_values}
     candidate_prec: Dict[float, List[float]] = {val: [] for val in candidate_values}
     candidate_rec: Dict[float, List[float]] = {val: [] for val in candidate_values}
@@ -443,9 +459,9 @@ def _trial_evaluation_worker(send_conn, evaluation_kind: str, payload: Dict[str,
 def _get_trial_process_context() -> Any:
     """Choose a multiprocessing start method for timeout-enforced trials."""
     methods = ("fork", "spawn")
-    if torch.cuda.is_available() and torch.cuda.is_initialized():
-        # Tune mode runs inference before Optuna; once CUDA is initialized,
-        # forking the parent process is unsafe and can hang.
+    if (torch.cuda.is_available() and torch.cuda.is_initialized()) or is_mps_available():
+        # Tune mode runs inference before Optuna; forking after an accelerator
+        # runtime is initialized is unsafe and can hang.
         methods = ("spawn", "fork")
 
     for method in methods:
@@ -936,9 +952,7 @@ class OptunaDecodingTuner:
             for trial in study.get_trials(
                 deepcopy=False, states=(optuna.trial.TrialState.RUNNING,)
             ):
-                study._storage.set_trial_state_values(
-                    trial._trial_id, optuna.trial.TrialState.FAIL
-                )
+                study._storage.set_trial_state_values(trial._trial_id, optuna.trial.TrialState.FAIL)
                 logger.info(
                     "Released orphan RUNNING trial #%d (params=%s) as FAIL so its "
                     "grid point can be re-sampled.",
@@ -1080,7 +1094,7 @@ class OptunaDecodingTuner:
         batch_params["cli_args"] = batch_cli
 
         payload = {
-            "decoder_fn": self.decoder_fn,
+            "decoder_fn_name": self.decoder_fn_name,
             "predictions_list": self.predictions_list,
             "ground_truth_list": self.ground_truth_list,
             "mask_list": self.mask_list,
@@ -1168,7 +1182,7 @@ class OptunaDecodingTuner:
         batch_params["return_all_thresholds"] = True
 
         payload = {
-            "decoder_fn": self.decoder_fn,
+            "decoder_fn_name": self.decoder_fn_name,
             "predictions_list": self.predictions_list,
             "ground_truth_list": self.ground_truth_list,
             "mask_list": self.mask_list,
@@ -1273,7 +1287,7 @@ class OptunaDecodingTuner:
         bad_value = _bad_objective_value(direction)
 
         payload = {
-            "decoder_fn": self.decoder_fn,
+            "decoder_fn_name": self.decoder_fn_name,
             "predictions_list": self.predictions_list,
             "ground_truth_list": self.ground_truth_list,
             "mask_list": self.mask_list,
@@ -1572,6 +1586,21 @@ class OptunaDecodingTuner:
 
         return postproc_params
 
+    @staticmethod
+    def _inject_batch_best_params(
+        decoding_params: Dict[str, Any], best_trial: "optuna.trial.FrozenTrial"
+    ) -> None:
+        """Restore inner-sweep parameters that are stored as trial attributes."""
+        best_ws_mt = best_trial.user_attrs.get("best_ws_merge_threshold", None)
+        if best_ws_mt is not None:
+            cli = decoding_params.get("cli_args", {})
+            cli["ws_merge_threshold"] = best_ws_mt
+            decoding_params["cli_args"] = cli
+
+        best_threshold = best_trial.user_attrs.get("best_threshold", None)
+        if best_threshold is not None:
+            decoding_params["thresholds"] = best_threshold
+
     def _print_results(self, study: optuna.Study):
         """Log optimization results."""
         best_trial = study.best_trial
@@ -1599,13 +1628,7 @@ class OptunaDecodingTuner:
 
         best_decoding_params = self._reconstruct_decoding_params(study.best_params)
 
-        # When ABISS batch mode was active, inject the best merge threshold
-        # back into the decoding params for display / saving.
-        best_ws_mt = best_trial.user_attrs.get("best_ws_merge_threshold", None)
-        if best_ws_mt is not None:
-            cli = best_decoding_params.get("cli_args", {})
-            cli["ws_merge_threshold"] = best_ws_mt
-            best_decoding_params["cli_args"] = cli
+        self._inject_batch_best_params(best_decoding_params, best_trial)
 
         lines.append("  Params:")
         for key, value in best_decoding_params.items():
@@ -1636,13 +1659,8 @@ class OptunaDecodingTuner:
         best_decoding_params = self._reconstruct_decoding_params(study.best_params)
         best_postproc_params = self._reconstruct_postproc_params(study.best_params)
 
-        # Inject best merge threshold from ABISS batch sweep.
         best_trial = study.best_trial
-        best_ws_mt = best_trial.user_attrs.get("best_ws_merge_threshold", None)
-        if best_ws_mt is not None:
-            cli = best_decoding_params.get("cli_args", {})
-            cli["ws_merge_threshold"] = best_ws_mt
-            best_decoding_params["cli_args"] = cli
+        self._inject_batch_best_params(best_decoding_params, best_trial)
 
         # Create YAML content
         params_dict = {

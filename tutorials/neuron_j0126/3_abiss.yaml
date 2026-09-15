@@ -1,0 +1,102 @@
+# j0126 step 2 of 3: affinity -> over-segmentation with ABISS.
+#
+#   python scripts/run_abiss_chunk.py --config tutorials/neuron_j0126/3_abiss.yaml --prepare-only
+#   python scripts/run_abiss_chunk.py --config tutorials/neuron_j0126/3_abiss.yaml
+#
+# Input   outputs/neuron_j0126/affinity/   step 1's float16 affinity chunks
+# Output  .../precomputed/seg              ABISS segmentation (CloudVolume precomputed)
+#
+# ABISS manages its own chunk hierarchy and chunked watershed/agglomeration, so this file
+# is consumed by `scripts/run_abiss_chunk.py`, not by `scripts/main.py`.
+#
+# WHY THESE THRESHOLDS. The pipeline deliberately UNDER-agglomerates here and repairs the
+# splits in step 3. In connectomics a split is cheap (a proofreader reconnects it) and a
+# merge is expensive (it corrupts two neurons), and step 3's grow round is provably
+# merge-safe -- it only ever assigns a fragment to a host, never welds two segments. So
+# every ambiguous decision is better deferred to step 3 than taken here.
+# AGG_THRESHOLD 0.20 with WS_HIGH 0.9 / WS_LOW 0.1 is the setting that reproduces the
+# reference segmentation this tutorial was measured on.
+#
+# CPU scaling: ABISS uses every CPU granted to this process by the scheduler. Submit this
+# as one shared-memory job (for example, Slurm `--cpus-per-task=64`), not a job array:
+# hierarchy levels have strict barriers and all workers write the same output layers.
+
+_base_: params.yaml
+
+abiss_chunk:
+  abiss_home: ${params.paths.repository}/lib/abiss
+  workdir: ${params.paths.output_root}/abiss/run
+  secrets_dir: ${params.paths.output_root}/abiss/secrets
+  param_path: ${params.paths.output_root}/abiss/secrets/param
+
+  # A virtual dataset over step 2's chunk store, built by `run_j0126.py` right
+  # before this step. It copies nothing -- the whole-volume affinity is ~4 TB --
+  # but reads through h5py exactly like a stitched file.
+  source_affinity_h5: ${params.data.affinity_h5}
+  source_dataset: main
+
+  # On-disk precomputed storage chunks (NOT the ABISS logical chunk grid).
+  copy_block_shape_xyz: [512, 512, 64]
+  aff_chunk_size_xyz: [512, 512, 64]
+  seg_chunk_size_xyz: [512, 512, 80]
+  resolution_xyz: [10, 10, 10]
+
+  # top_mip and root_tag are derived from BBOX / CHUNK_SIZE below; pinning them
+  # here only creates a second place to get the chunk hierarchy wrong.
+  overlap_mode: 0
+  meta_dirs: []
+
+  param:
+    NAME: j0126_abiss
+
+    AFF_PATH: file://${params.paths.output_root}/abiss/precomputed/affinity
+    WS_PATH: file://${params.paths.output_root}/abiss/precomputed/ws
+    SEG_PATH: file://${params.paths.output_root}/abiss/precomputed/seg
+    SCRATCH_PATH: file://${params.paths.output_root}/abiss/scratch
+    CHUNKMAP_OUTPUT: file://${params.paths.output_root}/abiss/chunkmap
+    AFF_RESOLUTION: 0
+
+    # Exclusion mask: FFN tissue AND the 0/255 border ring, built by the mask
+    # step. This is the "ABISS, exclusion mask" row of the README's table; the
+    # affinity is zeroed outside it before the watershed sees it.
+    AFF_KEEP_MASK: ${params.data.keep_mask}
+
+    # External nucleus identities. Empty NUC_PATH disables competitive nucleus
+    # growth entirely, which is the default because no nucleus volume ships with
+    # this tutorial; point it at one to get the "+ nucleus instance certificate"
+    # rows. NUC_RATIO expands one source voxel to mip-0 tags, so ABISS_NUC_MIN_TAGGED
+    # of 1024 is four source voxels -- enough that a resampling-edge speck cannot
+    # become an identity.
+    NUC_PATH: ${params.data.nucleus_volume}
+    NUC_RATIO: ${params.data.nucleus_ratio}
+    NUC_OFFSET: [0, 0, 0]
+    NUC_MIN_SHARE: 0.02
+    NUC_CONTACT_UM: 8.0
+    NUC_COMPETITION_MARGIN_ZYX: [1024, 1024, 512]
+    NUC_COMPETITION_FACTOR: 4
+    ABISS_NUC_DOMINANCE: 0.6
+    ABISS_NUC_MIN_TAGGED: 1024
+
+    # Mip-0 XYZ. The true EM extent of the 10 nm volume is 5700 x 10913 x 10664 (ZYX);
+    # in ABISS's XYZ order that is [0, 0, 0, 10664, 10913, 5700].
+    BBOX: [0, 0, 0, 10664, 10913, 5700]
+
+    # Large in XY to minimise cross-face stitching, chunked in Z for memory.
+    CHUNK_SIZE: [10664, 10913, 80]
+
+    # Conservative watershed: seeds only where affinity is unambiguous.
+    WS_HIGH_THRESHOLD: 0.9
+    WS_LOW_THRESHOLD: 0.1
+    WS_SIZE_THRESHOLD: 400
+    WS_DUST_THRESHOLD: 200
+
+    # Mean-edge agglomeration threshold. Deliberately conservative -- see the header.
+    AGG_THRESHOLD: 0.20
+
+    PARANOID: false
+    CHUNKED_AGG_OUTPUT: false
+
+notes:
+  - "Export the precomputed seg to h5/zarr for step 3, or point step 3's contact-graph builder at the precomputed volume directly."
+  - "seg_chunk_size_xyz must align with every internal CHUNK_SIZE boundary on axes with multiple chunks; with CHUNK_SIZE z=80 the seg z chunk must be 80, not 64."
+  - "Nothing in this step uses ground truth; the thresholds were chosen to under-agglomerate on principle, not fitted to the test skeletons."

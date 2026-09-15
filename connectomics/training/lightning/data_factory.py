@@ -52,6 +52,90 @@ def _effective_patch_size(cfg: Config) -> tuple[int, ...]:
     return tuple(patch_size[i] + pre[i] + post[i] for i in range(len(patch_size)))
 
 
+def _volume_crop(cfg: Config, split: str) -> Optional[List[int]]:
+    """``data.<split>.crop`` as a plain list of ints, or None."""
+    crop = getattr(getattr(cfg.data, split), "crop", None)
+    return None if crop is None else [int(v) for v in crop]
+
+
+def _reject_volume_crop_on_lazy(cfg: Config, backend_name: str) -> None:
+    """The lazy datasets index the stored volume directly and cannot honour a crop.
+
+    Raise instead of ignoring it: a silently dropped crop reads as "the fix is in"
+    while every patch still spends most of its loss mask on the ignore sentinel.
+    """
+    for split in ("train", "val"):
+        if _volume_crop(cfg, split) is not None:
+            raise ValueError(
+                f"data.{split}.crop is set but the lazy {backend_name} dataset does not "
+                "support it. Use the preloaded-cache path (data.dataloader.profile: cached "
+                "with use_preloaded_cache_train/val: true), or crop the stored volume."
+            )
+
+
+def _read_downscale(cfg: Config) -> tuple[float, ...]:
+    """Return validated per-axis train/val native-read scale factors."""
+    raw = getattr(cfg.data.dataloader, "read_downscale", 1.0)
+    ndim = len(cfg.data.dataloader.patch_size)
+    if isinstance(raw, (list, tuple)):
+        factors = tuple(float(value) for value in raw)
+        if len(factors) != ndim:
+            raise ValueError(
+                "data.dataloader.read_downscale must be a scalar or have one factor "
+                f"per patch axis ({ndim}); got {raw}."
+            )
+    else:
+        factors = (float(raw),) * ndim
+    if any(value <= 0.0 for value in factors):
+        raise ValueError(
+            "data.dataloader.read_downscale factors must be positive; "
+            f"got {raw}. Use 1.0 for native reads, or e.g. [1, 2, 2] "
+            "to read native 4 nm XY data then downsample to 8 nm."
+        )
+    return factors
+
+
+def _read_patch_size(cfg: Config) -> tuple[int, ...]:
+    """Native train/val crop size = effective patch size * read_downscale.
+
+    With ``read_downscale == 1.0`` this is exactly ``_effective_patch_size``
+    (a no-op). Non-unit factors permit resampling an anisotropic native crop to
+    model space. ``data.data_transform.resize`` restores the effective patch
+    size before erosion/affinity target generation, so target and model sizes
+    stay unchanged.
+    """
+    eff = _effective_patch_size(cfg)
+    factors = _read_downscale(cfg)
+    if all(value == 1.0 for value in factors):
+        return eff
+    return tuple(int(round(e * factor)) for e, factor in zip(eff, factors))
+
+
+def _validate_read_downscale(cfg: Config) -> None:
+    """Guard: non-unit ``read_downscale`` requires ``resize == effective patch size``.
+
+    ``data.data_transform.resize`` must return the effective patch size;
+    otherwise the model would silently train at an unintended input size.
+    Validated once at datamodule build time so the failure is loud and early.
+    """
+    factors = _read_downscale(cfg)
+    if all(value == 1.0 for value in factors):
+        return
+    eff = _effective_patch_size(cfg)
+    resize = getattr(cfg.data.data_transform, "resize", None)
+    resize_tuple = tuple(int(v) for v in resize) if resize else None
+    if resize_tuple != eff:
+        raise ValueError(
+            "data.dataloader.read_downscale="
+            f"{list(factors)} (with a non-unit factor) requires "
+            "data.data_transform.resize to equal the "
+            f"effective patch size {list(eff)} (= patch_size + target_context) "
+            "so the smaller native read is upsampled back exactly. "
+            f"Got data.data_transform.resize={resize}. "
+            f"Set data.data_transform.resize: {list(eff)}."
+        )
+
+
 def _validation_dataset_mode(cfg: Config) -> str:
     return "train" if bool(getattr(cfg.data.dataloader, "val_random_sampling", False)) else "val"
 
@@ -309,6 +393,10 @@ def create_datamodule(
         ConnectomicsDataModule instance
     """
     logger.info("Creating datasets...")
+    # read_downscale is a train-time read optimization; validate the resize
+    # guard before any dataset is constructed so a misconfig fails loudly/early.
+    if mode == "train":
+        _validate_read_downscale(cfg)
     _maybe_prepare_random_data(cfg, mode)
 
     # Auto-download tutorial data if missing
@@ -853,7 +941,7 @@ def create_datamodule(
                 else None
             ),
             mask_paths=[d.get("mask") for d in train_data_dicts],
-            patch_size=_effective_patch_size(cfg),
+            patch_size=_read_patch_size(cfg),
             iter_num=iter_num,
             transforms=augment_only_transforms,
             pre_cache_transforms=train_pre_cache_transforms,
@@ -864,6 +952,7 @@ def create_datamodule(
             foreground_threshold=cfg.data.dataloader.cached_sampling_foreground_threshold,
             crop_to_nonzero_mask=cfg.data.dataloader.cached_sampling_crop_to_nonzero_mask,
             sample_nonzero_mask=cfg.data.dataloader.cached_sampling_sample_nonzero_mask,
+            volume_crop=_volume_crop(cfg, "train"),
         )
 
         preloaded_num_workers = num_workers
@@ -921,7 +1010,7 @@ def create_datamodule(
                         else None
                     ),
                     mask_paths=[d.get("mask") for d in val_data_dicts],
-                    patch_size=_effective_patch_size(cfg),
+                    patch_size=_read_patch_size(cfg),
                     iter_num=val_steps_per_epoch,
                     transforms=val_only_transforms,
                     pre_cache_transforms=val_pre_cache_transforms,
@@ -932,6 +1021,7 @@ def create_datamodule(
                     foreground_threshold=cfg.data.dataloader.cached_sampling_foreground_threshold,
                     crop_to_nonzero_mask=cfg.data.dataloader.cached_sampling_crop_to_nonzero_mask,
                     sample_nonzero_mask=cfg.data.dataloader.cached_sampling_sample_nonzero_mask,
+                    volume_crop=_volume_crop(cfg, "val"),
                 )
             else:
                 from monai.data import CacheDataset, Dataset
@@ -999,6 +1089,7 @@ def create_datamodule(
                 f"Got: {train_images[:3]}"
             )
 
+        _reject_volume_crop_on_lazy(cfg, backend_name)
         logger.info("Using lazy %s volume loading (crop-on-read, no full preload)", backend_name)
         from torch.utils.data import DataLoader
 
@@ -1009,7 +1100,7 @@ def create_datamodule(
             label_paths=None if all(p is None for p in train_labels) else train_labels,
             label_aux_paths=None if all(p is None for p in train_label_auxs) else train_label_auxs,
             mask_paths=None if all(p is None for p in train_masks) else train_masks,
-            patch_size=_effective_patch_size(cfg),
+            patch_size=_read_patch_size(cfg),
             iter_num=iter_num,
             transforms=train_transforms_lazy,
             mode="train",
@@ -1059,7 +1150,7 @@ def create_datamodule(
                 label_paths=None if all(p is None for p in val_labels) else val_labels,
                 label_aux_paths=None if all(p is None for p in val_label_aux) else val_label_aux,
                 mask_paths=None if all(p is None for p in val_masks) else val_masks,
-                patch_size=_effective_patch_size(cfg),
+                patch_size=_read_patch_size(cfg),
                 iter_num=val_steps_per_epoch,
                 transforms=val_transforms_lazy,
                 mode=_validation_dataset_mode(cfg),
