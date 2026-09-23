@@ -116,9 +116,13 @@ dmypy.json
 # data
 *.h5
 *.sh
+!tutorials/dispim_gcloud/vm_stage.sh
+!tutorials/**/run_everything.sh
 ._*
 .DS_Store
 *.pth
+# model weights: release payloads are uploaded (HF), never committed
+*.ckpt
 
 # vim
 *.swp
@@ -161,6 +165,11 @@ notebooks/
 .ccc/
 .codex
 .claude
-.agent/
+#.agent/
+.agent_archive/
 slurm_jobs/
 .gcp-run/
+
+# Per-tutorial local config: bucket names, local paths, and pointers to source
+# drops. Kept out of a PUBLIC repo. The tracked `.example` documents the schema.
+tutorials/*/data.yaml
